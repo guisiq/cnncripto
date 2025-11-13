@@ -1,0 +1,11 @@
+.env.example
+data/
+models/
+embeddings/
+backtests/
+*.pyc
+__pycache__/
+.pytest_cache/
+*.log
+.venv/
+venv/
