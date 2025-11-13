@@ -100,6 +100,101 @@ def prepare_simple_targets(data: pd.DataFrame) -> tuple:
     return X_short_list, X_long_list, y_list, feature_data.shape[1]
 
 
+def plot_training_history(history: dict, output_dir: Path, total_time: float, epochs: int, best_loss: float):
+    """Plota gráfico com histórico de treinamento"""
+    import matplotlib.pyplot as plt
+    
+    if len(history['time_min']) == 0:
+        print("⚠️  Sem dados para plotar")
+        return
+    
+    print(f"\n📊 Gerando gráfico de evolução...")
+    
+    fig, axes = plt.subplots(2, 2, figsize=(14, 10))
+    fig.suptitle(f'Evolução do Treinamento - {total_time/60:.1f} min, {epochs} épocas', 
+                 fontsize=14, fontweight='bold')
+    
+    time_axis = history['time_min']
+    
+    # 1. Loss ao longo do tempo
+    ax1 = axes[0, 0]
+    ax1.plot(time_axis, history['loss'], 'b-', linewidth=2, label='Loss')
+    ax1.axhline(y=best_loss, color='r', linestyle='--', label=f'Best: {best_loss:.4f}')
+    ax1.set_xlabel('Tempo (minutos)')
+    ax1.set_ylabel('Loss (MSE)')
+    ax1.set_title('Loss ao Longo do Tempo')
+    ax1.grid(True, alpha=0.3)
+    ax1.legend()
+    
+    # 2. Acurácia ao longo do tempo
+    ax2 = axes[0, 1]
+    accuracy_pct = [a * 100 for a in history['accuracy']]
+    ax2.plot(time_axis, accuracy_pct, 'g-', linewidth=2)
+    ax2.axhline(y=50, color='gray', linestyle='--', alpha=0.5, label='Random (50%)')
+    ax2.set_xlabel('Tempo (minutos)')
+    ax2.set_ylabel('Acurácia (%)')
+    ax2.set_title('Acurácia de Direção')
+    ax2.grid(True, alpha=0.3)
+    ax2.legend()
+    ax2.set_ylim([0, 100])
+    
+    # 3. Média das predições
+    ax3 = axes[1, 0]
+    ax3.plot(time_axis, history['pred_mean'], 'purple', linewidth=2, label='Média')
+    ax3.fill_between(
+        time_axis,
+        [m - s for m, s in zip(history['pred_mean'], history['pred_std'])],
+        [m + s for m, s in zip(history['pred_mean'], history['pred_std'])],
+        alpha=0.3,
+        label='±1 std'
+    )
+    ax3.axhline(y=0, color='black', linestyle='-', alpha=0.3)
+    ax3.axhline(y=1, color='red', linestyle='--', alpha=0.3, label='Long (+1)')
+    ax3.axhline(y=-1, color='blue', linestyle='--', alpha=0.3, label='Short (-1)')
+    ax3.set_xlabel('Tempo (minutos)')
+    ax3.set_ylabel('Valor da Predição')
+    ax3.set_title('Distribuição das Predições')
+    ax3.grid(True, alpha=0.3)
+    ax3.legend()
+    ax3.set_ylim([-1.2, 1.2])
+    
+    # 4. Épocas por minuto (velocidade)
+    ax4 = axes[1, 1]
+    epochs_per_interval = []
+    for i in range(1, len(history['epoch'])):
+        epoch_diff = history['epoch'][i] - history['epoch'][i-1]
+        time_diff = history['time_min'][i] - history['time_min'][i-1]
+        if time_diff > 0:
+            epochs_per_interval.append(epoch_diff / time_diff)
+        else:
+            epochs_per_interval.append(0)
+    
+    if epochs_per_interval:
+        ax4.plot(time_axis[1:], epochs_per_interval, 'orange', linewidth=2)
+        ax4.set_xlabel('Tempo (minutos)')
+        ax4.set_ylabel('Épocas / minuto')
+        ax4.set_title('Velocidade de Treinamento')
+        ax4.grid(True, alpha=0.3)
+    else:
+        ax4.text(0.5, 0.5, 'Dados insuficientes', ha='center', va='center',
+                transform=ax4.transAxes)
+    
+    plt.tight_layout()
+    
+    # Salvar
+    plot_path = output_dir / 'training_evolution.png'
+    plt.savefig(plot_path, dpi=150, bbox_inches='tight')
+    print(f"✅ Gráfico salvo: {plot_path}")
+    
+    # Tentar mostrar (se em ambiente interativo)
+    try:
+        plt.show(block=False)
+    except:
+        pass
+    
+    plt.close()
+
+
 def train_time_based(
     pipeline: TradingPipeline,
     X_short_list: list,
@@ -154,6 +249,16 @@ def train_time_based(
     iteration = 0
     epoch = 0
     best_loss = float('inf')
+    
+    # Histórico para gráfico
+    history = {
+        'time_min': [],
+        'epoch': [],
+        'loss': [],
+        'accuracy': [],
+        'pred_mean': [],
+        'pred_std': []
+    }
     
     print(f"\n🚀 Iniciando treinamento...")
     print(f"   Início: {datetime.now().strftime('%H:%M:%S')}")
@@ -282,6 +387,14 @@ def train_time_based(
                 pred_std=pred_std
             )
             
+            # Salvar no histórico
+            history['time_min'].append(elapsed / 60)
+            history['epoch'].append(epoch)
+            history['loss'].append(loss)
+            history['accuracy'].append(accuracy)
+            history['pred_mean'].append(pred_mean)
+            history['pred_std'].append(pred_std)
+            
             last_log_time = current_time
         
         epoch_time = time.time() - epoch_start
@@ -293,14 +406,6 @@ def train_time_based(
     # Final
     total_time = time.time() - start_time
     
-    print(f"\n{'='*70}")
-    print(f"  ✅ TREINAMENTO COMPLETO!")
-    print(f"{'='*70}")
-    print(f"⏱️  Tempo total: {total_time/60:.2f} minutos")
-    print(f"📈 Épocas completadas: {epoch}")
-    print(f"📉 Melhor loss: {best_loss:.6f}")
-    print(f"💾 Modelos salvos automaticamente")
-    
     # Salvar modelos finais
     output_dir = Path("./training_results_time_based")
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -311,9 +416,13 @@ def train_time_based(
     pipeline.macronet.save_model(macro_path)
     pipeline.micronet.save_model(micro_path)
     
-    print(f"\n📁 Modelos salvos:")
-    print(f"   MacroNet: {macro_path}")
-    print(f"   MicroNet: {micro_path}")
+    # Plotar gráfico de evolução
+    plot_training_history(history, output_dir, total_time, epoch, best_loss)
+    
+    # Print final resumido
+    print(f"\n✅ Treinamento completo: {epoch} épocas em {total_time/60:.1f}min")
+    print(f"📉 Best loss: {best_loss:.4f}")
+    print(f"💾 Modelos e gráficos salvos em: {output_dir}/")
     
     return {
         'epochs': epoch,
@@ -321,7 +430,8 @@ def train_time_based(
         'total_time_min': total_time / 60,
         'best_loss': best_loss,
         'final_loss': loss,
-        'final_accuracy': accuracy
+        'final_accuracy': accuracy,
+        'history': history
     }
 
 
