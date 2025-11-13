@@ -45,6 +45,17 @@ class DecisionHead(nn.Module):
             nn.Linear(hidden_dim // 2, 1),
             nn.Tanh()  # Output in [-1, 1]
         )
+        
+        # Inicialização de pesos melhor para evitar sinais próximos de zero
+        self._init_weights()
+    
+    def _init_weights(self):
+        """Inicializa pesos com Xavier/Glorot para melhor convergência"""
+        for m in self.modules():
+            if isinstance(m, nn.Linear):
+                nn.init.xavier_uniform_(m.weight, gain=0.5)  # gain menor para Tanh
+                if m.bias is not None:
+                    nn.init.constant_(m.bias, 0)
     
     def forward(self, x_short, macro_embedding):
         """

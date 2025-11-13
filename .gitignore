@@ -9,3 +9,4 @@ __pycache__/
 *.log
 .venv/
 venv/
+training_results/
