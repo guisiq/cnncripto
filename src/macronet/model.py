@@ -186,6 +186,49 @@ class MacroNet:
         )
         
         logger.info("model_built", model_params=sum(p.numel() for p in self.model.parameters()))
+
+    def _prepare_input_array(self, X):
+        """
+        Ensure X is a numeric, contiguous float32 ndarray suitable for torch.from_numpy.
+        Handles dtype=object by attempting safe conversion and provides a helpful
+        error message if conversion fails.
+        """
+        X_arr = np.asarray(X)
+        # Quick shape/dtype info for debugging
+        try:
+            dtype = X_arr.dtype
+            shape = X_arr.shape
+        except Exception:
+            raise RuntimeError(f"Invalid input X: cannot determine dtype/shape. type(X)={type(X)}")
+
+        if dtype == object:
+            # Try a fast path first
+            try:
+                X_arr = X_arr.astype(np.float32)
+            except Exception:
+                # Fall back to elementwise conversion, mapping None -> np.nan
+                flat = []
+                for v in X_arr.ravel():
+                    if v is None:
+                        flat.append(np.nan)
+                    else:
+                        try:
+                            flat.append(float(v))
+                        except Exception as exc:
+                            raise RuntimeError(
+                                "Failed to convert array element to float. "
+                                f"Example bad value: {v!r} (type {type(v)}). "
+                                "Ensure inputs are numeric or None."
+                            ) from exc
+                X_arr = np.array(flat, dtype=np.float32).reshape(shape)
+        else:
+            # Not object dtype: ensure numeric
+            if not np.issubdtype(dtype, np.number):
+                raise RuntimeError(f"Input array has non-numeric dtype: {dtype}")
+            X_arr = X_arr.astype(np.float32)
+
+        # Make contiguous and return
+        return np.ascontiguousarray(X_arr, dtype=np.float32)
     
     def train(self, X: np.ndarray, epochs: int = None, batch_size: int = None):
         """
@@ -202,9 +245,10 @@ class MacroNet:
         if self.model is None:
             input_dim = X.shape[2]
             self.build_model(input_dim)
-        
-        # Convert to tensors
-        X_tensor = torch.from_numpy(X).float().to(self.device_obj)
+
+        # Prepare and convert to tensors
+        X_np = self._prepare_input_array(X)
+        X_tensor = torch.from_numpy(X_np).to(self.device_obj)
         dataset = TensorDataset(X_tensor)
         loader = DataLoader(dataset, batch_size=batch_size, shuffle=True)
         
@@ -245,9 +289,10 @@ class MacroNet:
         """
         if self.model is None:
             raise ValueError("Model not built or loaded")
-        
-        X_tensor = torch.from_numpy(X).float().to(self.device_obj)
-        
+
+        X_np = self._prepare_input_array(X)
+        X_tensor = torch.from_numpy(X_np).to(self.device_obj)
+
         with torch.no_grad():
             embeddings = self.model.encode(X_tensor)
         

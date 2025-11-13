@@ -95,15 +95,15 @@ def test_macronet():
     X = np.random.randn(1, 100, 13).astype(np.float32)
     
     print("⏳ Inicializando MacroNet...")
-    macronet = MacroNet(embedding_dim=config.macro.embedding_dim)
-    
+    macronet = MacroNet(config_obj=config.macronet)
+
     print("⏳ Treinando por 2 epochs...")
     macronet.train(X, epochs=2)
     
     print("⏳ Gerando embedding...")
     embedding = macronet.encode(X)
     
-    assert embedding.shape == (1, config.macro.embedding_dim), f"Embedding shape errado: {embedding.shape}"
+    assert embedding.shape == (1, config.macronet.embedding_dim), f"Embedding shape errado: {embedding.shape}"
     
     print(f"✓ MacroNet funcionando!")
     print(f"  Input: {X.shape}")
@@ -122,24 +122,22 @@ def test_micronet():
     y = np.random.randn(1, 1).astype(np.float32)
     
     print("⏳ Inicializando MicroNet...")
-    micronet = MicroNet(
-        short_feature_dim=13,
-        short_lookback=60,
-        macro_embedding_dim=128
-    )
+    micronet = MicroNet(config_obj=config.micronet)
     
     print("⏳ Treinando por 2 epochs...")
     micronet.train(X_short, X_macro, y, epochs=2)
     
     print("⏳ Gerando sinal...")
     signal = micronet.predict(X_short, X_macro)
-    
-    assert -1.0 <= signal <= 1.0, f"Signal fora do range: {signal}"
-    
+    # predict may return array; take scalar for display/assert
+    signal_val = float(signal.flatten()[0]) if hasattr(signal, 'flatten') else float(signal)
+
+    assert -1.0 <= signal_val <= 1.0, f"Signal fora do range: {signal_val}"
+
     print(f"✓ MicroNet funcionando!")
     print(f"  Short input: {X_short.shape}")
     print(f"  Macro input: {X_macro.shape}")
-    print(f"  Signal: {signal:.4f}")
+    print(f"  Signal: {signal_val:.4f}")
     
     return True
 
@@ -154,19 +152,18 @@ def test_backtest():
     
     print("⏳ Executando backtest...")
     backtester = SimpleBacktester(
-        initial_balance=10000,
+        initial_cash=10000,
         commission=config.backtest.commission,
-        slippage=config.backtest.slippage
     )
     
     results = backtester.backtest(prices, signals)
     
     assert 'total_return' in results, "total_return não encontrado!"
-    assert 'sharpe' in results, "sharpe não encontrado!"
+    assert 'sharpe_ratio' in results, "sharpe_ratio não encontrado!"
     
     print(f"✓ Backtest funcionando!")
     print(f"  Total return: {results['total_return']*100:.2f}%")
-    print(f"  Sharpe ratio: {results['sharpe']:.2f}")
+    print(f"  Sharpe ratio: {results['sharpe_ratio']:.2f}")
     print(f"  Max drawdown: {results['max_drawdown']*100:.2f}%")
     print(f"  Trades: {results['num_trades']:.0f}")
     
@@ -196,7 +193,17 @@ def test_pipeline():
     embedding = pipeline.generate_macro_embedding("BTCUSDT", days_back=2)
     print(f"  ✓ Embedding: {embedding.shape}")
     
-    print("⏳ Passo 5: Generate signal...")
+    print("⏳ Passo 5: Train micronet...")
+    # Train micronet with actual feature dimensions from pipeline
+    short_data_features = pipeline.extract_feature_arrays(short_data)  # (60, 10)
+    # Expand to batch: (10, 60, 10)
+    X_short_train = np.repeat(short_data_features[np.newaxis, :, :], 10, axis=0).astype(np.float32)
+    X_macro_train = np.random.randn(10, 128).astype(np.float32)
+    y_train = np.random.uniform(-1, 1, (10, 1)).astype(np.float32)
+    pipeline.micronet.train(X_short_train, X_macro_train, y_train, epochs=1)
+    print(f"  ✓ Trained")
+    
+    print("⏳ Passo 6: Generate signal...")
     signal = pipeline.predict_signal("BTCUSDT")
     print(f"  ✓ Signal: {signal:.4f}")
     

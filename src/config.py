@@ -105,24 +105,12 @@ class Config:
         """Auto-detect best available device (GPU/MPS/CPU)"""
         try:
             import torch
-            # Try to detect Intel Extension for PyTorch (ipex) - provides XPU support
-            try:
-                import intel_extension_for_pytorch as ipex  # type: ignore
-                # If import succeeds, prefer xpu device name
-                # Note: actual runtime device may still be 'cpu' but ipex will accelerate
-                return "xpu"
-            except Exception:
-                # ipex not installed; continue with other backends
-                pass
-            
             # Priority: CUDA > MPS (Apple) > CPU
             if torch.cuda.is_available():
                 return "cuda"
-            
             # Apple Silicon (M1, M2, M3, etc) - Metal Performance Shaders
             if hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
                 return "mps"
-            
             # Intel GPU (Arc, Iris Xe) - via oneAPI
             # Some builds expose torch.backends.xpu for Intel GPUs
             if hasattr(torch.backends, "xpu") and getattr(torch.backends.xpu, "is_available", lambda: False)():

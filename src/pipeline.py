@@ -84,7 +84,18 @@ class TradingPipeline:
         """Extract feature matrix from DataFrame"""
         exclude_cols = ['timestamp', 'date', 'open', 'high', 'low', 'close', 'volume', 'quote_volume']
         feature_cols = [c for c in df.columns if c not in exclude_cols]
-        return df[feature_cols].values
+        
+        # Select only numeric columns to avoid dtype=object
+        numeric_cols = [c for c in feature_cols if np.issubdtype(df[c].dtype, np.number)]
+        
+        if len(numeric_cols) == 0:
+            raise ValueError(f"No numeric feature columns found. Available: {feature_cols}")
+        
+        logger.info("extract_features", numeric_cols=len(numeric_cols), total_cols=len(feature_cols))
+        
+        # Convert to float32 and ensure contiguity
+        X = np.ascontiguousarray(df[numeric_cols].values, dtype=np.float32)
+        return X
     
     def train_macronet(self, symbol: str, days_back: int = 30):
         """Train MacroNet on historical data"""
@@ -200,7 +211,15 @@ class TradingPipeline:
             logger.warning("no_short_data")
             return 0.0
         
-        X_short = X_short_feats[-1:].astype(np.float32)
+        # Use last 60 timesteps (full short window) for prediction
+        X_short = X_short_feats[-60:].astype(np.float32)  # Shape: (60, num_features)
+        if X_short.shape[0] < 60:
+            # Pad if not enough data
+            pad_size = 60 - X_short.shape[0]
+            X_short = np.vstack([np.zeros((pad_size, X_short.shape[1])), X_short]).astype(np.float32)
+        
+        # Reshape to (1, 60, num_features) for batch
+        X_short = X_short[np.newaxis, :, :].astype(np.float32)
         macro_emb = self.current_macro_embedding[np.newaxis, :].astype(np.float32)
         
         score = self.micronet.predict(X_short, macro_emb)[0]

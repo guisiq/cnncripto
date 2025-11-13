@@ -117,7 +117,15 @@ class MicroNet:
         batch_size = batch_size or self.config.batch_size
         
         if self.model is None:
-            short_dim = X_short.shape[1]
+            # Support X_short as either (N, features) or (N, seq_len, features_per_timestep)
+            if X_short.ndim == 3:
+                # flatten time x features -> vector
+                short_dim = X_short.shape[1] * X_short.shape[2]
+            elif X_short.ndim == 2:
+                short_dim = X_short.shape[1]
+            else:
+                raise ValueError(f"Unsupported X_short ndim: {X_short.ndim}")
+
             macro_dim = macro_embeddings.shape[1]
             self.build_model(short_dim, macro_dim)
         
@@ -125,6 +133,10 @@ class MicroNet:
         X_short_tensor = torch.from_numpy(X_short).float().to(self.device_obj)
         macro_tensor = torch.from_numpy(macro_embeddings).float().to(self.device_obj)
         y_tensor = torch.from_numpy(y).float().to(self.device_obj)
+        # If short input is 3D (batch, seq_len, features), flatten to (batch, seq_len*features)
+        if X_short_tensor.dim() == 3:
+            N = X_short_tensor.size(0)
+            X_short_tensor = X_short_tensor.view(N, -1)
         
         dataset = TensorDataset(X_short_tensor, macro_tensor, y_tensor)
         loader = DataLoader(dataset, batch_size=batch_size, shuffle=True)
@@ -170,6 +182,9 @@ class MicroNet:
         
         X_short_tensor = torch.from_numpy(X_short).float().to(self.device_obj)
         macro_tensor = torch.from_numpy(macro_embeddings).float().to(self.device_obj)
+        if X_short_tensor.dim() == 3:
+            N = X_short_tensor.size(0)
+            X_short_tensor = X_short_tensor.view(N, -1)
         
         with torch.no_grad():
             scores = self.model(X_short_tensor, macro_tensor)
