@@ -531,7 +531,7 @@ class AsymmetricNEATTrainer:
         update_macro: bool = False,
         update_micro: bool = True,
         use_multiprocessing: bool = True,
-        max_steps: int = 200  # Reduzido de 500 para 200 para speedup
+        max_steps: int = 150  # Ajustado para 150 para melhor cobertura temporal
     ) -> Tuple[float, float, float, float, float, float, float]:
         """
         Executar uma geração de evolução com MULTIPROCESSING REAL.
@@ -964,45 +964,65 @@ def train_asymmetric_neat(
     print("="*70 + "\n")
     
     # 1. Carregar dados
-    print("📅 Carregando dados de 2024 a partir do parquet local...")
+    print("📅 Carregando dados de 2023-2024 de múltiplos símbolos...")
     from src.features.builder import FeatureBuilder
     from datetime import datetime
 
-    data_path = Path("data/timeframe=5m/symbol=BTCUSDT/candles.parquet")
-    if not data_path.exists():
-        raise FileNotFoundError(f"Arquivo não encontrado em {data_path.resolve()}")
-
-    df = pd.read_parquet(data_path, engine="pyarrow")
-    if 'timestamp' not in df.columns:
-        raise KeyError("Coluna 'timestamp' ausente")
-
-    df['timestamp'] = pd.to_datetime(df['timestamp'])
-    df = df.sort_values('timestamp').reset_index(drop=True)
-
-    numeric_cols = [
-        'open', 'high', 'low', 'close', 'volume', 'quote_volume',
-        'trades_count', 'taker_buy_volume'
-    ]
-    for col in numeric_cols:
-        if col in df.columns:
-            df[col] = pd.to_numeric(df[col], errors='coerce')
-
-    df_2024 = df[
-        (df['timestamp'] >= datetime(2024, 1, 1)) &
-        (df['timestamp'] < datetime(2025, 1, 1))
-    ].copy()
-
-    if df_2024.empty:
-        raise ValueError("Dataset de 2024 está vazio")
-
-    builder = FeatureBuilder()
-    df_2024 = builder.add_features(df_2024)
+    # Símbolos para treinamento
+    symbols = ['BTCUSDT', 'ETHUSDT', 'BNBUSDT']
+    all_dfs = []
     
-    print(f"✅ {len(df_2024)} candles de 2024")
+    for symbol in symbols:
+        data_path = Path(f"data/timeframe=5m/symbol={symbol}/candles.parquet")
+        if not data_path.exists():
+            print(f"⚠️  Arquivo não encontrado: {data_path}, pulando {symbol}")
+            continue
+
+        df = pd.read_parquet(data_path, engine="pyarrow")
+        if 'timestamp' not in df.columns:
+            print(f"⚠️  Coluna 'timestamp' ausente em {symbol}, pulando")
+            continue
+
+        df['timestamp'] = pd.to_datetime(df['timestamp'])
+        df = df.sort_values('timestamp').reset_index(drop=True)
+
+        numeric_cols = [
+            'open', 'high', 'low', 'close', 'volume', 'quote_volume',
+            'trades_count', 'taker_buy_volume'
+        ]
+        for col in numeric_cols:
+            if col in df.columns:
+                df[col] = pd.to_numeric(df[col], errors='coerce')
+
+        # Filtrar 2 anos: 2023-2024
+        df_filtered = df[
+            (df['timestamp'] >= datetime(2023, 1, 1)) &
+            (df['timestamp'] < datetime(2025, 1, 1))
+        ].copy()
+
+        if df_filtered.empty:
+            print(f"⚠️  Dataset vazio para {symbol} no período 2023-2024, pulando")
+            continue
+
+        builder = FeatureBuilder()
+        df_filtered = builder.add_features(df_filtered)
+        df_filtered['symbol'] = symbol  # Marcar símbolo
+        all_dfs.append(df_filtered)
+        
+        print(f"✅ {symbol}: {len(df_filtered)} candles (2023-2024)")
+    
+    if not all_dfs:
+        raise ValueError("Nenhum símbolo foi carregado com sucesso")
+    
+    # Concatenar todos os símbolos
+    df_combined = pd.concat(all_dfs, ignore_index=True)
+    df_combined = df_combined.sort_values('timestamp').reset_index(drop=True)
+    
+    print(f"✅ Total combinado: {len(df_combined)} candles de {len(all_dfs)} símbolos")
     
     # 2. Preparar dados
     prices, macro_features, micro_features = prepare_asymmetric_data(
-        df_2024,
+        df_combined,
         macro_window=492,
         micro_window=60
     )
@@ -1091,7 +1111,7 @@ def train_asymmetric_neat(
             update_macro=macro_update,
             update_micro=micro_update,
             use_multiprocessing=True,  # ATIVADO!
-            max_steps=100  # Reduzido para speedup
+            max_steps=150  # Ajustado para 150 steps por episódio
         )
         best_macro_fitness, best_micro_fitness, avg_macro_portfolio, avg_micro_portfolio, avg_macro_reward, avg_micro_reward, eval_time = result
         
