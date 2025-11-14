@@ -435,7 +435,15 @@ class AsymmetricRLTrainer:
         gamma: float = 0.99,
         device: str = "cpu"
     ):
-        self.device = torch.device(device)
+        # Força MPS quando disponível em Apple Silicon, senão usa device passado
+        if torch.backends.mps.is_available():
+            effective_device = "mps"
+            print(f"✅ MPS (Apple Silicon GPU) disponível - usando MPS")
+        else:
+            effective_device = device
+            print(f"⚠️  MPS não disponível - usando device: {device}")
+        
+        self.device = torch.device(effective_device)
         self.gamma = gamma
         
         # Build policy network
@@ -1197,22 +1205,56 @@ Gânglios Basais (Micro):      Ações habituais rápidas
 
 if __name__ == "__main__":
     import os
-    # Prefer MPS on Apple Silicon, fall back to config.device
-    preferred_device = "mps" if torch.backends.mps.is_available() else config.device
+    
+    # ═══════════════════════════════════════════════════════════
+    # SETUP MPS (Apple Silicon GPU)
+    # ═══════════════════════════════════════════════════════════
+    print("\n" + "="*70)
+    print("  ⚙️  CONFIGURAÇÃO DE DISPOSITIVO")
+    print("="*70)
+    
+    # Verificar disponibilidade de MPS
+    mps_available = torch.backends.mps.is_available()
+    print(f"🔍 MPS disponível: {mps_available}")
+    
+    if mps_available:
+        # Validar compilação com suporte MPS
+        mps_built = torch.backends.mps.is_built()
+        print(f"🔧 PyTorch compilado com MPS: {mps_built}")
+        if mps_built:
+            print(f"✅ Usando MPS (Metal Performance Shaders) para aceleração")
+            preferred_device = "mps"
+        else:
+            print(f"⚠️  PyTorch não foi compilado com suporte MPS, usando CPU")
+            preferred_device = "cpu"
+    else:
+        print(f"ℹ️  MPS não disponível neste sistema, usando CPU")
+        preferred_device = "cpu"
+    
+    # Atualizar config.device globalmente
     try:
         config.device = preferred_device
-    except Exception:
-        pass
-
-    # Tune threads for preprocessing
+        print(f"✅ config.device atualizado para: {config.device}")
+    except Exception as e:
+        print(f"⚠️  Não foi possível atualizar config.device: {e}")
+    
+    # Tune threads CPU para pré-processamento
     try:
         torch.set_num_threads(os.cpu_count() or 4)
-    except Exception:
-        pass
-
-    print(f"⚙️  Dispositivo preferido: {preferred_device}")
-
+        print(f"✅ Threads CPU ajustados para: {os.cpu_count() or 4}")
+    except Exception as e:
+        print(f"⚠️  Erro ao ajustar threads CPU: {e}")
+    
+    print("="*70 + "\n")
+    
     # Incremental runs to benchmark scalability: increase num_envs stepwise
-    env_steps = [8, 16, 32, 64]
+    # Comentado: descomente a linha abaixo para rodar múltiplos testes com num_envs incrementais
+    # env_steps = [8, 16, 32, 64]
+    # for n in env_steps:
+    #     print(f"\n=== Test run: num_envs={n} (duracao curta para benchmarking) ===")
+    #     train_asymmetric_rl(duration_minutes=0.5, log_interval_seconds=20, num_envs=n)
+    #     time.sleep(2)
+    
+    # Single run com num_envs=25 (ajuste conforme necessário)
     train_asymmetric_rl(duration_minutes=999.9, log_interval_seconds=20, num_envs=25)
     
