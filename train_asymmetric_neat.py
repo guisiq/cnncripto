@@ -725,9 +725,11 @@ class AsymmetricNEATTrainer:
 
             self.generation_micro += 1
         
-        # Atualizar step_idx nos ambientes para próxima geração (persistência)
+        # Atualizar step_idx nos ambientes para próxima geração (persistência com salto temporal)
+        # Salto de ~66 candles (5.5 horas) entre gerações para explorar diferentes períodos do dataset
+        GENERATION_JUMP_CANDLES = 66  # ~5.5 horas em timeframe 5m
         for env in envs:
-            pass  # step_idx já foi avançado pelos workers via env.step()
+            env.step_idx = min(env.step_idx + GENERATION_JUMP_CANDLES, len(env.prices) - 1)
         
         eval_total_time = time.time() - eval_start_time
         return self.best_macro_fitness, self.best_micro_fitness, avg_macro_portfolio, avg_micro_portfolio, avg_macro_reward, avg_micro_reward, eval_total_time
