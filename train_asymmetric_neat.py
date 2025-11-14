@@ -47,6 +47,131 @@ from src.logger import get_logger
 
 logger = get_logger(__name__)
 
+
+# ============================================================================
+# FUNÇÕES AUXILIARES PARA ANÁLISE DA TOPOLOGIA NEAT
+# ============================================================================
+
+def calculate_network_depth(genome: neat.DefaultGenome, config: neat.Config) -> int:
+    """
+    Calcula a profundidade máxima da rede NEAT (número máximo de camadas).
+    
+    Args:
+        genome: Genoma NEAT
+        config: Configuração NEAT
+    
+    Returns:
+        Profundidade máxima (número de camadas desde input até output)
+    """
+    # Obter nós de entrada e saída
+    input_nodes = set(range(-config.genome_config.num_inputs, 0))
+    output_nodes = set(range(config.genome_config.num_outputs))
+    
+    # Criar grafo de conexões ativas
+    connections = {}
+    for conn_key, conn in genome.connections.items():
+        if conn.enabled:
+            input_node, output_node = conn_key
+            if output_node not in connections:
+                connections[output_node] = []
+            connections[output_node].append(input_node)
+    
+    # Calcular profundidade usando BFS reverso (de output para inputs)
+    max_depth = 0
+    for output_node in output_nodes:
+        depth = _calculate_node_depth(output_node, connections, input_nodes, set())
+        max_depth = max(max_depth, depth)
+    
+    return max_depth
+
+
+def _calculate_node_depth(node, connections, input_nodes, visited):
+    """Helper recursivo para calcular profundidade de um nó."""
+    if node in visited:
+        return 0  # Evitar ciclos
+    if node in input_nodes:
+        return 1  # Nós de entrada têm profundidade 1
+    
+    visited.add(node)
+    
+    if node not in connections:
+        return 1  # Nó sem predecessores
+    
+    # Profundidade = 1 + máxima profundidade dos predecessores
+    max_pred_depth = 0
+    for pred in connections[node]:
+        pred_depth = _calculate_node_depth(pred, connections, input_nodes, visited)
+        max_pred_depth = max(max_pred_depth, pred_depth)
+    
+    return 1 + max_pred_depth
+
+
+def calculate_network_width(genome: neat.DefaultGenome, config: neat.Config) -> int:
+    """
+    Calcula a largura máxima da rede NEAT (número máximo de nós em uma camada).
+    
+    Args:
+        genome: Genoma NEAT
+        config: Configuração NEAT
+    
+    Returns:
+        Largura máxima (número máximo de nós em qualquer camada)
+    """
+    # Obter nós de entrada e saída
+    input_nodes = set(range(-config.genome_config.num_inputs, 0))
+    output_nodes = set(range(config.genome_config.num_outputs))
+    
+    # Criar grafo de conexões ativas
+    connections = {}
+    for conn_key, conn in genome.connections.items():
+        if conn.enabled:
+            input_node, output_node = conn_key
+            if output_node not in connections:
+                connections[output_node] = []
+            connections[output_node].append(input_node)
+    
+    # Atribuir camada a cada nó
+    node_layers = {}
+    
+    # Inputs na camada 0
+    for node in input_nodes:
+        node_layers[node] = 0
+    
+    # Calcular camada dos outros nós
+    for output_node in output_nodes:
+        _assign_node_layer(output_node, connections, input_nodes, node_layers, set())
+    
+    # Contar nós por camada
+    layer_counts = {}
+    for node, layer in node_layers.items():
+        layer_counts[layer] = layer_counts.get(layer, 0) + 1
+    
+    # Retornar largura máxima
+    return max(layer_counts.values()) if layer_counts else 0
+
+
+def _assign_node_layer(node, connections, input_nodes, node_layers, visited):
+    """Helper recursivo para atribuir camada a um nó."""
+    if node in visited:
+        return node_layers.get(node, 0)
+    if node in node_layers:
+        return node_layers[node]
+    
+    visited.add(node)
+    
+    if node not in connections:
+        node_layers[node] = 1
+        return 1
+    
+    # Camada = 1 + máxima camada dos predecessores
+    max_pred_layer = 0
+    for pred in connections[node]:
+        pred_layer = _assign_node_layer(pred, connections, input_nodes, node_layers, visited)
+        max_pred_layer = max(max_pred_layer, pred_layer)
+    
+    node_layers[node] = max_pred_layer + 1
+    return node_layers[node]
+
 # ============================================================================
 # FUNÇÕES TOP-LEVEL PARA MULTIPROCESSING (devem estar fora de classes)
 # ============================================================================
@@ -1023,7 +1148,7 @@ def train_asymmetric_neat(
     # 2. Preparar dados
     prices, macro_features, micro_features = prepare_asymmetric_data(
         df_combined,
-        macro_window=492,
+        macro_window=564,  # 47 horas (41h + 6h adicionais) = 564 candles × 5min
         micro_window=60
     )
     
@@ -1074,7 +1199,44 @@ def train_asymmetric_neat(
     
     # Multiprocessing ativado!
     print(f"🚀 Usando MULTIPROCESSING com {cpu_count()} workers (paralelização real!)")
-    print(f"⚡ Steps reduzidos para 200 para maior velocidade")
+    print(f"⚡ Steps ajustados para 150 por episódio (~12.5h de avaliação)")
+    
+    # ════════════════════════════════════════════════════════════════
+    # TREINAMENTO COM COMPLEXIDADE INCREMENTAL
+    # ════════════════════════════════════════════════════════════════
+    # Estratégia: Começar com períodos curtos e aumentar gradualmente
+    # - Fase 1: 5 gerações (salto 66 × 5 = 330 candles = 27.5h)
+    # - Fase 2: 7 gerações (salto 66 × 7 = 462 candles = 38.5h)
+    # - Fase 3: 10 gerações (salto 66 × 10 = 660 candles = 55h)
+    # - Fase 4: 15 gerações (salto 66 × 15 = 990 candles = 82.5h)
+    # - Continua até fim de 2024
+    
+    curriculum_phases = [
+        {'generations': 10, 'name': 'Iniciante'},
+        {'generations': 15, 'name': 'Intermediário'},
+        {'generations': 20, 'name': 'Avançado'},
+        {'generations': 30, 'name': 'Expert'},
+        {'generations': 40, 'name': 'Master'},
+        {'generations': 50, 'name': 'Elite'},
+        {'generations': 60, 'name': 'Elite1'},
+        {'generations': 70, 'name': 'Elite2'},
+        {'generations': 80, 'name': 'Elite3'},
+        {'generations': 90, 'name': 'Elite4'},
+        {'generations': 100, 'name': 'Elite5'}
+    ]
+    
+    current_phase_idx = 0
+    generations_in_current_phase = 0
+    phase_start_step_idx = 0  # step_idx inicial de cada fase
+    
+    print("\n" + "="*70)
+    print("  📚 TREINAMENTO COM COMPLEXIDADE INCREMENTAL")
+    print("="*70)
+    for idx, phase in enumerate(curriculum_phases, 1):
+        horizon_candles = 66 * phase['generations']
+        horizon_hours = horizon_candles * 5 / 60
+        print(f"  Fase {idx} ({phase['name']}): {phase['generations']} gerações = {horizon_hours:.1f}h de dados")
+    print("="*70 + "\n")
 
     # 5. Evoluir
     start_time = time.time()
@@ -1098,6 +1260,40 @@ def train_asymmetric_neat(
 
     while time.time() < end_time:
         elapsed = time.time() - start_time
+        
+        # ════════════════════════════════════════════════════════════════
+        # CURRICULUM LEARNING: Verificar se deve avançar para próxima fase
+        # ════════════════════════════════════════════════════════════════
+        current_phase = curriculum_phases[current_phase_idx]
+        generations_in_current_phase += 1
+        
+        # Se completou as gerações da fase atual, avança para próxima
+        if generations_in_current_phase >= current_phase['generations']:
+            # Avançar apenas uma fração do período da fase (50% de overlap)
+            # Isso permite que as fases tenham interseção
+            overlap_ratio = 0.8  # 50% de sobreposição entre fases
+            phase_advance_candles = int(66 * current_phase['generations'] * overlap_ratio)
+            phase_start_step_idx += phase_advance_candles
+            
+            # Aplicar o novo step_idx a todos os ambientes
+            for env in envs:
+                env.step_idx = min(phase_start_step_idx, len(env.prices) - 1)
+            
+            # Avançar para próxima fase se disponível
+            if current_phase_idx < len(curriculum_phases) - 1:
+                current_phase_idx += 1
+                generations_in_current_phase = 0
+                current_phase = curriculum_phases[current_phase_idx]
+                
+                horizon_candles = 66 * current_phase['generations']
+                horizon_hours = horizon_candles * 5 / 60
+                print(f"\n🎓 NOVA FASE: {current_phase['name']} ({current_phase['generations']} gerações = {horizon_hours:.1f}h)")
+                print(f"   Step inicial: {phase_start_step_idx}")
+                print(f"   Overlap: {overlap_ratio*100:.0f}% com fase anterior\n")
+            else:
+                # Última fase: continuar até fim de 2024, depois resetar
+                generations_in_current_phase = 0  # Reset counter mas mantém fase
+                print(f"\n🔄 Reciclando fase {current_phase['name']} - continuando até fim do dataset\n")
         
         # Padrão 1:10 - Macro evolui a cada 10 episódios, Micro evolui sempre
         macro_update = (episode % 10 == 0)  # Macro: episódios 0, 10, 20, 30...
@@ -1126,17 +1322,37 @@ def train_asymmetric_neat(
         # Log periódico
         current_time = time.time()
         if current_time - last_log_time >= log_interval_seconds or episode % 5 == 0:
+            # Calcular dimensões das melhores redes
+            best_macro_genome_id = max(
+                trainer.macro_population.population,
+                key=lambda g: trainer.macro_population.population[g].fitness or -np.inf
+            )
+            best_macro_genome = trainer.macro_population.population[best_macro_genome_id]
+            
+            best_micro_genome_id = max(
+                trainer.micro_population.population,
+                key=lambda g: trainer.micro_population.population[g].fitness or -np.inf
+            )
+            best_micro_genome = trainer.micro_population.population[best_micro_genome_id]
+            
+            # Calcular dimensões
+            macro_depth = calculate_network_depth(best_macro_genome, trainer.config_macro)
+            macro_width = calculate_network_width(best_macro_genome, trainer.config_macro)
+            micro_depth = calculate_network_depth(best_micro_genome, trainer.config_micro)
+            micro_width = calculate_network_width(best_micro_genome, trainer.config_micro)
+            
             if not table_header_printed:
-                print("\nTempo(min) | Episódio | MacroUpd | MicroUpd | Ratio | Fitness Macro | Fitness Micro | Reward Médio")
-                print("-" * 120)
+                print("\nTempo(min) | Episódio | Fase         | Gen/Fase | MacroUpd | MicroUpd | Ratio | Fitness Macro | Fitness Micro | Reward Médio | MacroL | MacroP | MicroL | MicroP")
+                print("-" * 175)
                 table_header_printed = True
             
             ratio = trainer.generation_micro / max(1, trainer.generation_macro)
 
             print(
-                f"{elapsed/60:>9.1f} | {episode:>8} | {trainer.generation_macro:>8} | "
-                f"{trainer.generation_micro:>8} | {ratio:>5.1f} | {best_macro_fitness:>13.6f} | "
-                f"{best_micro_fitness:>13.6f} | {best_micro_fitness:>12.6f}"
+                f"{elapsed/60:>9.1f} | {episode:>8} | {current_phase['name']:>12} | {generations_in_current_phase:>8} | "
+                f"{trainer.generation_macro:>8} | {trainer.generation_micro:>8} | {ratio:>5.1f} | "
+                f"{best_macro_fitness:>13.6f} | {best_micro_fitness:>13.6f} | {best_micro_fitness:>12.6f} | "
+                f"{macro_width:>6} | {macro_depth:>6} | {micro_width:>6} | {micro_depth:>6}"
             )
             
             history['time_min'].append(elapsed / 60)
@@ -1146,6 +1362,25 @@ def train_asymmetric_neat(
             history['best_macro_fitness'].append(best_macro_fitness)
             history['best_micro_fitness'].append(best_micro_fitness)
             history['avg_reward'].append(best_micro_fitness)
+            
+            # Adicionar dimensões das redes ao histórico
+            if 'macro_width' not in history:
+                history['macro_width'] = []
+                history['macro_depth'] = []
+                history['micro_width'] = []
+                history['micro_depth'] = []
+            
+            history['macro_width'].append(macro_width)
+            history['macro_depth'].append(macro_depth)
+            history['micro_width'].append(micro_width)
+            history['micro_depth'].append(micro_depth)
+            
+            # Adicionar info de fase ao histórico
+            if 'phase' not in history:
+                history['phase'] = []
+                history['phase_generation'] = []
+            history['phase'].append(current_phase['name'])
+            history['phase_generation'].append(generations_in_current_phase)
             
             last_log_time = current_time
 
