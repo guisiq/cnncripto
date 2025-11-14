@@ -73,19 +73,23 @@ def evaluate_macro_genome_worker(genome_data, config_macro, envs_data, max_steps
     # Criar rede NEAT uma vez (otimização!)
     net = neat.nn.FeedForwardNetwork.create(genome, config_macro)
     
-    total_return = 0.0
+    total_reward = 0.0
     num_envs = 0
     
     for env in envs:
         state = env.reset()
         steps = 0
+        episode_reward = 0.0
         
         while steps < max_steps:
             # Forward pass
             macro_output = net.activate(state['macro_features'])
             macro_output = np.asarray(macro_output, dtype=np.float32)
             
-            # Escolher ação
+            # Usar saída bruta da rede como previsão (-1 a +1)
+            prediction_value = float(macro_output[0])
+            
+            # Escolher ação (mantido para compatibilidade, mas não usado no reward)
             action_logits = macro_output[:3]
             if action_logits.shape[0] < 3:
                 action_logits = np.pad(action_logits, (0, 3 - action_logits.shape[0]), constant_values=0.0)
@@ -95,7 +99,8 @@ def evaluate_macro_genome_worker(genome_data, config_macro, envs_data, max_steps
             else:
                 action = int(np.argmax(action_logits))
             
-            next_state, reward, done = env.step(action)
+            next_state, reward, done = env.step(action, prediction_value)
+            episode_reward += reward
             steps += 1
             
             if done or next_state is None:
@@ -103,11 +108,10 @@ def evaluate_macro_genome_worker(genome_data, config_macro, envs_data, max_steps
             
             state = next_state
         
-        final_return = ((env.portfolio_value - 10000) / 10000) * 100
-        total_return += final_return
+        total_reward += episode_reward
         num_envs += 1
     
-    fitness = total_return / max(1, num_envs)
+    fitness = total_reward / max(1, num_envs)
     genome.fitness = fitness
     return genome_id, genome, fitness
 
@@ -134,12 +138,13 @@ def evaluate_micro_genome_worker(genome_data, config_micro, best_macro_genome, c
     macro_net = neat.nn.FeedForwardNetwork.create(best_macro_genome, config_macro)
     micro_net = neat.nn.FeedForwardNetwork.create(genome, config_micro)
     
-    total_return = 0.0
+    total_reward = 0.0
     num_envs = 0
     
     for env in envs:
         state = env.reset()
         steps = 0
+        episode_reward = 0.0
         
         while steps < max_steps:
             # Macro context
@@ -153,9 +158,14 @@ def evaluate_micro_genome_worker(genome_data, config_micro, best_macro_genome, c
             ])
             
             micro_output = np.asarray(micro_net.activate(micro_input), dtype=np.float32)
+            
+            # Usar saída bruta da rede como previsão (-1 a +1)
+            prediction_value = float(micro_output[0])
+            
             action = np.argmax(micro_output) % 3
             
-            next_state, reward, done = env.step(action)
+            next_state, reward, done = env.step(action, prediction_value)
+            episode_reward += reward
             steps += 1
             
             if done or next_state is None:
@@ -163,11 +173,10 @@ def evaluate_micro_genome_worker(genome_data, config_micro, best_macro_genome, c
             
             state = next_state
         
-        final_return = ((env.portfolio_value - 10000) / 10000) * 100
-        total_return += final_return
+        total_reward += episode_reward
         num_envs += 1
     
-    fitness = total_return / max(1, num_envs)
+    fitness = total_reward / max(1, num_envs)
     genome.fitness = fitness
     return genome_id, genome, fitness
 
@@ -289,9 +298,18 @@ class TradingEnvironmentRL:
             'portfolio_value': self.portfolio_value
         }
     
-    def step(self, action: int) -> Tuple[dict, float, bool]:
+    def step(self, action: int, prediction_value: float = 0.0) -> Tuple[dict, float, bool]:
         """
-        Execute action: 0=HOLD, 1=BUY, 2=SELL
+        Execute action usando valor bruto da rede como previsão.
+        
+        Args:
+            action: ação escolhida (não usado mais)
+            prediction_value: valor bruto da saída da rede (pode ser positivo ou negativo)
+                             - Negativo = prevê queda
+                             - Positivo = prevê alta
+                             - Magnitude = confiança
+        
+        Fitness = (prediction_value * 100) * (price_change_pct * 100)
         
         Returns:
             next_state, reward, done
@@ -302,31 +320,16 @@ class TradingEnvironmentRL:
         current_price = self.prices[self.step_idx]
         next_price = self.prices[self.step_idx + 1]
         
-        # Execute action
-        if action == 1 and self.position < 1.0:  # BUY
-            trade_size = 1.0 - self.position
-            cost = trade_size * current_price * (1 + self.commission)
-            if cost <= self.cash:
-                self.cash -= cost
-                self.position += trade_size
+        # Calculate actual price change percentage
+        price_change_pct = ((next_price - current_price) / current_price) * 100
         
-        elif action == 2 and self.position > -1.0:  # SELL
-            trade_size = self.position - (-1.0)
-            proceeds = trade_size * current_price * (1 - self.commission)
-            self.cash += proceeds
-            self.position -= trade_size
+        # Reward = (previsão normalizada) * (mudança real normalizada)
+        # Exemplo: previsão -0.5, real -0.3% → (100*-0.5)*(100*-0.3) = (-50)*(-30) = +1500
+        # Exemplo: previsão -0.5, real +0.3% → (100*-0.5)*(100*+0.3) = (-50)*(30) = -1500
+        reward = (prediction_value * 100) * (price_change_pct * 100)
         
         # Advance
         self.step_idx += 1
-        
-        # Calculate reward (P&L)
-        price_change = next_price - current_price
-        position_pnl = self.position * price_change
-        reward = (position_pnl / self.initial_capital) * 100
-        
-        # Penalty for trading
-        if action != 0:
-            reward -= 0.01
         
         # Update portfolio
         self.portfolio_value = self.cash + (self.position * next_price)
@@ -389,6 +392,9 @@ class AsymmetricNEATTrainer:
         # Criar rede NEAT uma vez para reutilização (OTIMIZAÇÃO!)
         net = neat.nn.FeedForwardNetwork.create(genome, self.config_macro)
         
+        # 🔍 Debug: coletar estatísticas de saída da rede
+        all_predictions = []
+        
         for env_idx, env in enumerate(envs):
             state = env.reset()
             total_reward = 0.0
@@ -398,21 +404,15 @@ class AsymmetricNEATTrainer:
                 # Forward pass: usar rede já criada (mais rápido!)
                 macro_output = np.asarray(net.activate(state['macro_features']), dtype=np.float32)
                 
-                # Macro output = contexto de longo prazo
-                # Simplicidade: usar saída diretamente como "confiança" para ações
-                # Na implementação real, isso seria passado para a micro
+                # Usar primeiro valor da saída como previsão bruta
+                # Valor negativo = prevê queda, positivo = prevê alta
+                prediction_value = float(macro_output[0]) if len(macro_output) > 0 else 0.0
+                all_predictions.append(prediction_value)
                 
-                # Usar primeiras 3 saídas como logits de ação (HOLD, BUY, SELL)
-                action_logits = macro_output[:3]
-                if action_logits.shape[0] < 3:
-                    action_logits = np.pad(action_logits, (0, 3 - action_logits.shape[0]), constant_values=0.0)
-                # Fallback aleatório quando logits são quase idênticos (rede ainda neutra)
-                if np.allclose(action_logits, action_logits[0], atol=1e-6):
-                    action = np.random.randint(0, 3)
-                else:
-                    action = int(np.argmax(action_logits))
+                # Action não é mais usado, mas mantemos por compatibilidade
+                action = 0
                 
-                next_state, reward, done = env.step(action)
+                next_state, reward, done = env.step(action, prediction_value)
                 total_reward += reward
                 steps += 1
                 
@@ -421,13 +421,13 @@ class AsymmetricNEATTrainer:
                 
                 state = next_state
             
-            final_return = ((env.portfolio_value - 10000) / 10000) * 100
-            total_return += final_return
+            # Fitness = média dos rewards acumulados
+            total_return += total_reward
             num_envs += 1
         
         fitness = total_return / max(1, num_envs)
-        avg_portfolio = np.mean([env.portfolio_value for env in envs])
-        avg_step_reward = np.mean([total_reward for env in envs]) # Média da soma das recompensas
+        avg_portfolio = 10000  # Não usado mais
+        avg_step_reward = total_return / max(1, num_envs)
         return fitness, avg_portfolio, avg_step_reward
     
     def eval_micro_genome(
@@ -456,6 +456,9 @@ class AsymmetricNEATTrainer:
         macro_net = neat.nn.FeedForwardNetwork.create(macro_genome, self.config_macro)
         micro_net = neat.nn.FeedForwardNetwork.create(micro_genome, self.config_micro)
         
+        # 🔍 Debug: coletar estatísticas de saída da rede
+        all_predictions = []
+        
         for env in envs:
             state = env.reset()
             total_reward = 0.0
@@ -474,10 +477,14 @@ class AsymmetricNEATTrainer:
                 
                 micro_output = np.asarray(micro_net.activate(micro_input), dtype=np.float32)
                 
-                # Ação: argmax de micro output
+                # Usar saída bruta da rede como previsão (-1 a +1)
+                prediction_value = float(micro_output[0])
+                all_predictions.append(prediction_value)
+                
+                # Ação: argmax de micro output (mantido para compatibilidade, mas não usado no reward)
                 action = np.argmax(micro_output) % 3
                 
-                next_state, reward, done = env.step(action)
+                next_state, reward, done = env.step(action, prediction_value)
                 total_reward += reward
                 steps += 1
                 
@@ -486,13 +493,13 @@ class AsymmetricNEATTrainer:
                 
                 state = next_state
             
-            final_return = ((env.portfolio_value - 10000) / 10000) * 100
-            total_return += final_return
+            # Fitness = reward acumulado
+            total_return += total_reward
             num_envs += 1
         
         fitness = total_return / max(1, num_envs)
-        avg_portfolio = np.mean([env.portfolio_value for env in envs])
-        avg_step_reward = np.mean([total_reward for env in envs]) # Média da soma das recompensas
+        avg_portfolio = 10000  # Não usado mais
+        avg_step_reward = total_return / max(1, num_envs)
         return fitness, avg_portfolio, avg_step_reward
     
     def evolve_generation(
@@ -996,8 +1003,8 @@ def train_asymmetric_neat(
         'episode': [],
         'macro_updates': [],
         'micro_updates': [],
-        'avg_portfolio': [],
-        'avg_return_pct': [],
+        'best_macro_fitness': [],
+        'best_micro_fitness': [],
         'avg_reward': []
     }
     
@@ -1034,30 +1041,25 @@ def train_asymmetric_neat(
         current_time = time.time()
         if current_time - last_log_time >= log_interval_seconds or episode % 5 == 0:
             if not table_header_printed:
-                print("\nTempo(min) | Episódio | MacroUpd | MicroUpd | Ratio | Portfolio Médio | Δ%     | Reward Médio | Gap p/ Meta")
-                print("-" * 105)
+                print("\nTempo(min) | Episódio | MacroUpd | MicroUpd | Ratio | Fitness Macro | Fitness Micro | Reward Médio")
+                print("-" * 120)
                 table_header_printed = True
-            
-            avg_portfolio = np.mean(recent_portfolios) if recent_portfolios else 10000
-            return_pct = ((avg_portfolio - 10000) / 10000) * 100
-            reward_avg = best_micro_fitness  # Usar micro fitness como reward
-            gap_to_target = portfolio_target - avg_portfolio
             
             ratio = trainer.generation_micro / max(1, trainer.generation_macro)
 
             print(
                 f"{elapsed/60:>9.1f} | {episode:>8} | {trainer.generation_macro:>8} | "
-                f"{trainer.generation_micro:>8} | {ratio:>5.1f} | ${avg_portfolio:>14,.2f} | "
-                f"{return_pct:>6.2f}% | {reward_avg:>12.2f} | ${gap_to_target:>11,.2f}"
+                f"{trainer.generation_micro:>8} | {ratio:>5.1f} | {best_macro_fitness:>13.6f} | "
+                f"{best_micro_fitness:>13.6f} | {best_micro_fitness:>12.6f}"
             )
             
             history['time_min'].append(elapsed / 60)
             history['episode'].append(episode)
             history['macro_updates'].append(trainer.generation_macro)
             history['micro_updates'].append(trainer.generation_micro)
-            history['avg_portfolio'].append(avg_portfolio)
-            history['avg_return_pct'].append(return_pct)
-            history['avg_reward'].append(reward_avg)
+            history['best_macro_fitness'].append(best_macro_fitness)
+            history['best_micro_fitness'].append(best_micro_fitness)
+            history['avg_reward'].append(best_micro_fitness)
             
             last_log_time = current_time
 
@@ -1116,8 +1118,8 @@ def train_asymmetric_neat(
     print(f"\n✅ Treinamento NEAT assimétrico completo: {episode} episódios em {total_time/60:.1f}min")
     print(f"🔄 Total updates - Macro: {trainer.generation_macro} | Micro: {trainer.generation_micro}")
     print(f"📊 Ratio final: 1:{trainer.generation_micro/max(1, trainer.generation_macro):.2f}")
-    print(f"🧬 Melhor MacroNet fitness: {trainer.best_macro_fitness:.4f}")
-    print(f"🧬 Melhor MicroNet fitness: {trainer.best_micro_fitness:.4f}")
+    print(f"🧬 Melhor MacroNet fitness: {trainer.best_macro_fitness:.6f}")
+    print(f"🧬 Melhor MicroNet fitness: {trainer.best_micro_fitness:.6f}")
     print(f"💾 Genomas salvos em: {output_dir}/")
     
     # Plot
@@ -1139,25 +1141,25 @@ def plot_neat_evolution(history: dict, output_dir: Path, total_time: float, epis
     
     time_axis = history['time_min']
     
-    # 1. Portfolio
+    # 1. Fitness Macro
     ax1 = axes[0, 0]
-    ax1.plot(time_axis, history['avg_portfolio'], 'b-', linewidth=2)
-    ax1.axhline(y=10000, color='gray', linestyle='--', alpha=0.5, label='Initial')
+    ax1.plot(time_axis, history['best_macro_fitness'], 'r-', linewidth=2)
+    ax1.axhline(y=0, color='gray', linestyle='--', alpha=0.5, label='Zero')
     ax1.set_xlabel('Tempo (minutos)')
-    ax1.set_ylabel('Portfolio Value ($)')
-    ax1.set_title('Evolução do Portfolio')
+    ax1.set_ylabel('Fitness MacroNet')
+    ax1.set_title('Evolução Fitness MacroNet')
     ax1.grid(True, alpha=0.3)
     ax1.legend()
-    ax1.yaxis.set_major_formatter(plt.FuncFormatter(lambda x, p: f'${x/1000:.1f}k'))
     
-    # 2. Returns
+    # 2. Fitness Micro
     ax2 = axes[0, 1]
-    ax2.plot(time_axis, history['avg_return_pct'], 'g-', linewidth=2)
-    ax2.axhline(y=0, color='gray', linestyle='--', alpha=0.5)
+    ax2.plot(time_axis, history['best_micro_fitness'], 'b-', linewidth=2)
+    ax2.axhline(y=0, color='gray', linestyle='--', alpha=0.5, label='Zero')
     ax2.set_xlabel('Tempo (minutos)')
-    ax2.set_ylabel('Return (%)')
-    ax2.set_title('Retorno Percentual')
+    ax2.set_ylabel('Fitness MicroNet')
+    ax2.set_title('Evolução Fitness MicroNet')
     ax2.grid(True, alpha=0.3)
+    ax2.legend()
     
     # 3. Updates Count
     ax3 = axes[1, 0]
