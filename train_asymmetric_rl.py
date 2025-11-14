@@ -585,6 +585,141 @@ class AsymmetricRLTrainer:
         
         return total_reward, env.portfolio_value
 
+    def train_batch(
+        self,
+        envs: List[TradingEnvironmentRL],
+        update_macro: bool,
+        update_micro: bool,
+        max_steps: int = None
+    ) -> Tuple[float, float]:
+        """
+        Vectorized rollout across multiple environments (synchronized timesteps).
+
+        Runs all envs in lock-step, calling the policy once per timestep for the whole batch.
+        Returns mean reward and mean final portfolio across envs.
+        """
+        num_envs = len(envs)
+
+        # Reset all envs and collect initial states
+        states = [env.reset() for env in envs]
+        done = [False] * num_envs
+
+        log_probs_per_env: List[List[torch.Tensor]] = [[] for _ in range(num_envs)]
+        rewards_per_env: List[List[float]] = [[] for _ in range(num_envs)]
+
+        step = 0
+        while True:
+            # Stop conditions
+            if max_steps is not None and step >= max_steps:
+                break
+            if all(done):
+                break
+
+            # Build batch tensors for active envs
+            macro_batch = []
+            micro_batch = []
+            pos_batch = []
+            cash_batch = []
+            active_idx = []
+
+            for i, s in enumerate(states):
+                if done[i] or s is None:
+                    continue
+                macro_batch.append(np.asarray(s['macro_features'], dtype=np.float32))
+                micro_batch.append(np.asarray(s['micro_features'], dtype=np.float32))
+                pos_batch.append(s['position'])
+                cash_batch.append(s['cash'] / 10000.0)
+                active_idx.append(i)
+
+            if len(active_idx) == 0:
+                break
+
+            macro_tensor = torch.FloatTensor(np.stack(macro_batch)).to(self.device)
+            micro_tensor = torch.FloatTensor(np.stack(micro_batch)).to(self.device)
+            pos_tensor = torch.FloatTensor(pos_batch).to(self.device)
+            cash_tensor = torch.FloatTensor(cash_batch).to(self.device)
+
+            # Forward once for the batch
+            action_probs, _ = self.policy(macro_tensor, micro_tensor, pos_tensor, cash_tensor)
+            dists = Categorical(action_probs)
+            actions = dists.sample()
+            log_probs = dists.log_prob(actions)
+
+            # Step each active env with its action
+            for idx_in_batch, env_idx in enumerate(active_idx):
+                action = int(actions[idx_in_batch].item())
+                lp = log_probs[idx_in_batch]
+                next_state, reward, is_done = envs[env_idx].step(action)
+
+                log_probs_per_env[env_idx].append(lp)
+                rewards_per_env[env_idx].append(float(reward))
+                states[env_idx] = next_state
+                done[env_idx] = is_done
+
+            step += 1
+
+        # Compute returns per env and total loss
+        total_loss = 0.0
+        device = self.device
+        for i in range(num_envs):
+            rewards = rewards_per_env[i]
+            if len(rewards) == 0:
+                continue
+            returns = []
+            G = 0
+            for r in reversed(rewards):
+                G = r + self.gamma * G
+                returns.insert(0, G)
+
+            returns = torch.FloatTensor(returns).to(device)
+            if len(returns) > 1:
+                returns = (returns - returns.mean()) / (returns.std() + 1e-8)
+
+            l = []
+            for lp, G in zip(log_probs_per_env[i], returns):
+                l.append(-lp * G)
+
+            if len(l) > 0:
+                env_loss = torch.stack(l).sum()
+                total_loss = total_loss + env_loss
+
+        if isinstance(total_loss, float):
+            # no trainable data
+            return 0.0, float(np.mean([e.portfolio_value for e in envs]))
+
+        policy_loss = total_loss
+
+        # Selective backpropagation (same logic as train_episode)
+        if update_macro:
+            self.optimizer_macro.zero_grad()
+            policy_loss.backward(retain_graph=update_micro)
+            torch.nn.utils.clip_grad_norm_(
+                list(self.policy.macro_encoder.parameters()) +
+                list(self.policy.macro_bottleneck.parameters()) +
+                list(self.policy.macro_decoder.parameters()),
+                1.0
+            )
+            self.optimizer_macro.step()
+            self.macro_update_count += 1
+
+        if update_micro:
+            if not update_macro:
+                self.optimizer_micro.zero_grad()
+                policy_loss.backward()
+            torch.nn.utils.clip_grad_norm_(
+                list(self.policy.micro_processor.parameters()) +
+                list(self.policy.decision_head.parameters()),
+                1.0
+            )
+            self.optimizer_micro.step()
+            self.micro_update_count += 1
+
+        # Aggregate metrics
+        mean_reward = np.mean([np.sum(r) for r in rewards_per_env if len(r) > 0]) if any(len(r) > 0 for r in rewards_per_env) else 0.0
+        mean_portfolio = float(np.mean([e.portfolio_value for e in envs]))
+
+        return mean_reward, mean_portfolio
+
 
 def prepare_asymmetric_data(
     df: pd.DataFrame,
@@ -817,7 +952,7 @@ def train_asymmetric_rl(
         # Decidir quais componentes atualizar
         # Ratio 1:10 → a cada 11 episódios: [M+m, m, m, m, m, m, m, m, m, m, m]
         cycle_position = episode % 11
-        
+
         if cycle_position == 0:
             # Atualiza ambos (MacroNet + MicroNet)
             update_macro = True
@@ -826,18 +961,18 @@ def train_asymmetric_rl(
             # Atualiza apenas micro (episódios 1-10 do ciclo)
             update_macro = False
             update_micro = True
-        
-        # Treinar episódio
-        current_env = envs[episode % len(envs)]
-        total_reward, final_portfolio = trainer.train_episode(
-            current_env,
+
+        # Treinar um batch vetorizado sobre todos os ambientes
+        batch_reward, batch_portfolio = trainer.train_batch(
+            envs,
             update_macro=update_macro,
-            update_micro=update_micro
+            update_micro=update_micro,
+            max_steps=None
         )
-        
+
         episode += 1
-        recent_rewards.append(total_reward)
-        recent_portfolios.append(final_portfolio)
+        recent_rewards.append(batch_reward)
+        recent_portfolios.append(batch_portfolio)
         
         # Log periódico
         current_time = time.time()
