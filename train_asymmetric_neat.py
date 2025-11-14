@@ -564,7 +564,7 @@ class AsymmetricNEATTrainer:
         total_genomes_macro = len(macro_genomes)
         
         if use_multiprocessing and total_genomes_macro > 1:
-            with Pool(processes=cpu_count()) as pool:
+            with Pool(processes=min(6, cpu_count())) as pool:
                 eval_func = partial(
                     evaluate_macro_genome_worker,
                     config_macro=self.config_macro,
@@ -613,7 +613,7 @@ class AsymmetricNEATTrainer:
         micro_ids_before = set(self.micro_population.population.keys())
 
         if use_multiprocessing and total_genomes_micro > 1:
-            with Pool(processes=cpu_count()) as pool:
+            with Pool(processes=min(6, cpu_count())) as pool:
                 eval_func = partial(
                     evaluate_micro_genome_worker,
                     config_micro=self.config_micro,
@@ -1063,7 +1063,7 @@ def train_asymmetric_neat(
             update_macro=macro_update,
             update_micro=micro_update,
             use_multiprocessing=True,  # ATIVADO!
-            max_steps=200  # Reduzido para speedup
+            max_steps=100  # Reduzido para speedup
         )
         best_macro_fitness, best_micro_fitness, avg_macro_portfolio, avg_micro_portfolio, avg_macro_reward, avg_micro_reward, eval_time = result
         
@@ -1271,17 +1271,18 @@ if __name__ == "__main__":
             print(f"ℹ️  MPS não disponível, usando CPU")
             config.device = "cpu"
         
-        torch.set_num_threads(os.cpu_count() or 4)
-        print(f"✅ Threads CPU: {os.cpu_count() or 4}")
+        torch.set_num_threads(max(1, (os.cpu_count() or 4) // 2))
+        print(f"✅ Threads CPU: {torch.get_num_threads()}")
         print("="*70 + "\n")
-        
+        num_envs_safe = max(4, max(1, torch.get_num_threads() * 2))
+        population_size_safe =num_envs_safe*8
         # Rodar treinamento NEAT assimétrico
         train_asymmetric_neat(
-            duration_minutes=337.9,
+            duration_minutes=340.0,
             log_interval_seconds=30,
             portfolio_target=12000.0,
-            num_envs=8,
-            population_size=50
+            num_envs=num_envs_safe,  # Reduzido para 6 para otimizar uso de memória no M2/M3
+            population_size=population_size_safe # Reduzido para 40 para otimizar uso de memória no M2/M3
         )
     finally:
         # Finalizar caffeinate se foi iniciado
