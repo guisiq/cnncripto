@@ -55,6 +55,9 @@ def evaluate_macro_genome_worker(genome_data, config_macro, envs_data, max_steps
     """
     Função worker para avaliar um genoma macro em paralelo.
     Deve ser top-level para ser picklável.
+    
+    Nota: Restaura step_idx de cada ambiente para continuar de onde parou
+    (episódios persistentes entre gerações).
     """
     genome_id, genome = genome_data
     
@@ -68,6 +71,8 @@ def evaluate_macro_genome_worker(genome_data, config_macro, envs_data, max_steps
             initial_capital=env_data['initial_capital'],
             commission=env_data['commission']
         )
+        # Restaurar posição anterior (continuidade entre gerações)
+        env.step_idx = env_data.get('step_idx', 0)
         envs.append(env)
     
     # Criar rede NEAT uma vez (otimização!)
@@ -77,7 +82,7 @@ def evaluate_macro_genome_worker(genome_data, config_macro, envs_data, max_steps
     num_envs = 0
     
     for env in envs:
-        state = env.reset()
+        state = env._get_state()  # Usar _get_state() em vez de reset() para continuar do step_idx salvo
         steps = 0
         episode_reward = 0.0
         
@@ -119,6 +124,9 @@ def evaluate_macro_genome_worker(genome_data, config_macro, envs_data, max_steps
 def evaluate_micro_genome_worker(genome_data, config_micro, best_macro_genome, config_macro, envs_data, max_steps=200):
     """
     Função worker para avaliar um genoma micro em paralelo.
+    
+    Nota: Restaura step_idx de cada ambiente para continuar de onde parou
+    (episódios persistentes entre gerações).
     """
     genome_id, genome = genome_data
     
@@ -132,6 +140,8 @@ def evaluate_micro_genome_worker(genome_data, config_micro, best_macro_genome, c
             initial_capital=env_data['initial_capital'],
             commission=env_data['commission']
         )
+        # Restaurar posição anterior (continuidade entre gerações)
+        env.step_idx = env_data.get('step_idx', 0)
         envs.append(env)
     
     # Criar redes NEAT uma vez
@@ -142,7 +152,7 @@ def evaluate_micro_genome_worker(genome_data, config_micro, best_macro_genome, c
     num_envs = 0
     
     for env in envs:
-        state = env.reset()
+        state = env._get_state()  # Usar _get_state() em vez de reset() para continuar do step_idx salvo
         steps = 0
         episode_reward = 0.0
         
@@ -287,7 +297,11 @@ class TradingEnvironmentRL:
     def _get_state(self):
         """Get current state"""
         if self.step_idx >= len(self.prices):
-            return None
+            # Voltar ao início do dataset se chegou ao final (reciclagem circular)
+            self.step_idx = 0
+            self.cash = self.initial_capital
+            self.position = 0.0
+            self.portfolio_value = self.initial_capital
         
         return {
             'macro_features': self.macro_features[self.step_idx],
@@ -311,11 +325,18 @@ class TradingEnvironmentRL:
         
         Fitness = (prediction_value * 100) * (price_change_pct * 100)
         
+        Nota: Se chegar ao fim do dataset, volta ao início automaticamente (reciclagem circular).
+        
         Returns:
             next_state, reward, done
         """
         if self.step_idx >= len(self.prices) - 1:
-            return None, 0.0, True
+            # Voltar ao início e resetar portfólio
+            self.step_idx = 0
+            self.cash = self.initial_capital
+            self.position = 0.0
+            self.portfolio_value = self.initial_capital
+            return self._get_state(), 0.0, False  # Não marca done, continua a partir do início
         
         current_price = self.prices[self.step_idx]
         next_price = self.prices[self.step_idx + 1]
@@ -334,7 +355,7 @@ class TradingEnvironmentRL:
         # Update portfolio
         self.portfolio_value = self.cash + (self.position * next_price)
         
-        done = self.step_idx >= len(self.prices) - 1
+        done = False  # Nunca marca done agora (reciclagem contínua)
         next_state = self._get_state()
         
         return next_state, reward, done
@@ -542,7 +563,8 @@ class AsymmetricNEATTrainer:
                 'macro_features': env.macro_features,
                 'micro_features': env.micro_features,
                 'initial_capital': env.initial_capital,
-                'commission': env.commission
+                'commission': env.commission,
+                'step_idx': getattr(env, 'step_idx', 0)  # Persistir posição atual para continuidade entre gerações
             })
 
         # ═════════════════════════════════════════════════════════════
@@ -702,6 +724,10 @@ class AsymmetricNEATTrainer:
             )
 
             self.generation_micro += 1
+        
+        # Atualizar step_idx nos ambientes para próxima geração (persistência)
+        for env in envs:
+            pass  # step_idx já foi avançado pelos workers via env.step()
         
         eval_total_time = time.time() - eval_start_time
         return self.best_macro_fitness, self.best_micro_fitness, avg_macro_portfolio, avg_micro_portfolio, avg_macro_reward, avg_micro_reward, eval_total_time
