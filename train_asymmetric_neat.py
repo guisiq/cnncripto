@@ -407,6 +407,7 @@ class TradingEnvironmentRL:
         self.micro_features = micro_features
         self.initial_capital = initial_capital
         self.commission = commission
+        self.symbol = "UNKNOWN"  # Será definido externamente
         
         self.reset()
     
@@ -448,7 +449,10 @@ class TradingEnvironmentRL:
                              - Positivo = prevê alta
                              - Magnitude = confiança
         
-        Fitness = (prediction_value * 100) * (price_change_pct * 100)
+        Fitness: QUADRÁTICA COM BONUS DE CONFIANÇA
+        - Premia quadraticamente previsões confiantes corretas
+        - Penaliza quadraticamente previsões confiantes erradas
+        - Escala ~10x maior que linear original
         
         Nota: Se chegar ao fim do dataset, volta ao início automaticamente (reciclagem circular).
         
@@ -467,12 +471,28 @@ class TradingEnvironmentRL:
         next_price = self.prices[self.step_idx + 1]
         
         # Calculate actual price change percentage
-        price_change_pct = ((next_price - current_price) / current_price) * 100
+        price_change_pct = (next_price - current_price) / current_price
         
-        # Reward = (previsão normalizada) * (mudança real normalizada)
-        # Exemplo: previsão -0.5, real -0.3% → (100*-0.5)*(100*-0.3) = (-50)*(-30) = +1500
-        # Exemplo: previsão -0.5, real +0.3% → (100*-0.5)*(100*+0.3) = (-50)*(30) = -1500
-        reward = (prediction_value * 100) * (price_change_pct * 100)
+        # ════════════════════════════════════════════════════════════════
+        # FÓRMULA QUADRÁTICA COM BONUS DE CONFIANÇA (OTIMIZADA)
+        # ════════════════════════════════════════════════════════════════
+        
+        # Normalizar prediction para [-1, 1]
+        pred_norm = np.clip(prediction_value, -1, 1)
+        
+        # Magnitude da previsão (confiança) - sempre positiva
+        confidence = abs(pred_norm)
+        
+        # Cálculo direto do reward sem condicional
+        # np.sign retorna: -1 (negativo), 0 (zero), +1 (positivo)
+        # Comparação == retorna True (1) ou False (0), convertido para +1 ou -1
+        direction_multiplier = 2 * (np.sign(pred_norm) == np.sign(price_change_pct)) - 1
+        
+        # Base reward linear + Bonus/Penalidade quadrática
+        reward = (pred_norm * price_change_pct * 10000) + \
+                 ((confidence ** 2) * abs(price_change_pct) * 5000 * direction_multiplier)
+        
+        # ════════════════════════════════════════════════════════════════
         
         # Advance
         self.step_idx += 1
@@ -977,9 +997,34 @@ def create_vectorized_environments(
     micro_features: np.ndarray,
     num_envs: int,
     initial_capital: float = 10000.0,
-    commission: float = 0.001
+    commission: float = 0.001,
+    symbols_data: List[Dict] = None
 ) -> List[TradingEnvironmentRL]:
-    """Divide dataset em fatias para múltiplos ambientes."""
+    """
+    Cria ambientes balanceados por símbolo.
+    
+    Se symbols_data for fornecido, cria ambientes separados para cada símbolo
+    para garantir avaliação balanceada. Caso contrário, divide dataset em chunks.
+    
+    Args:
+        symbols_data: Lista de dicts com 'prices', 'macro_features', 'micro_features', 'symbol'
+    """
+    # Se temos dados separados por símbolo, criar um ambiente para cada
+    if symbols_data:
+        environments: List[TradingEnvironmentRL] = []
+        for symbol_data in symbols_data:
+            env = TradingEnvironmentRL(
+                prices=symbol_data['prices'],
+                macro_features=symbol_data['macro_features'],
+                micro_features=symbol_data['micro_features'],
+                initial_capital=initial_capital,
+                commission=commission
+            )
+            env.symbol = symbol_data.get('symbol', 'UNKNOWN')  # Marcar símbolo
+            environments.append(env)
+        return environments
+    
+    # Fallback: modo antigo (dividir dataset em chunks)
     total_samples = len(prices)
     if total_samples < 2:
         return []
@@ -1139,46 +1184,67 @@ def train_asymmetric_neat(
     if not all_dfs:
         raise ValueError("Nenhum símbolo foi carregado com sucesso")
     
-    # Concatenar todos os símbolos
-    df_combined = pd.concat(all_dfs, ignore_index=True)
-    df_combined = df_combined.sort_values('timestamp').reset_index(drop=True)
+    # ════════════════════════════════════════════════════════════════
+    # NOVO: Processar símbolos SEPARADAMENTE para avaliação balanceada
+    # ════════════════════════════════════════════════════════════════
+    print(f"\n🎯 Preparando dados por símbolo (avaliação balanceada)...")
+    symbols_data = []
     
-    print(f"✅ Total combinado: {len(df_combined)} candles de {len(all_dfs)} símbolos")
+    for df_symbol in all_dfs:
+        symbol_name = df_symbol['symbol'].iloc[0]
+        
+        # Preparar features para este símbolo
+        prices, macro_features, micro_features = prepare_asymmetric_data(
+            df_symbol,
+            macro_window=564,  # 47 horas
+            micro_window=60    # 5 horas
+        )
+        
+        symbols_data.append({
+            'symbol': symbol_name,
+            'prices': prices,
+            'macro_features': macro_features,
+            'micro_features': micro_features
+        })
+        
+        print(f"  ✅ {symbol_name}: {len(prices)} candles processados")
     
-    # 2. Preparar dados
-    prices, macro_features, micro_features = prepare_asymmetric_data(
-        df_combined,
-        macro_window=564,  # 47 horas (41h + 6h adicionais) = 564 candles × 5min
-        micro_window=60
-    )
-    
+    # Criar ambientes separados por símbolo (1 ambiente por símbolo)
     envs = create_vectorized_environments(
-        prices=prices,
-        macro_features=macro_features,
-        micro_features=micro_features,
-        num_envs=num_envs,
+        prices=None,  # Não usado quando symbols_data é fornecido
+        macro_features=None,
+        micro_features=None,
+        num_envs=len(symbols_data),
         initial_capital=10000.0,
-        commission=0.001
+        commission=0.001,
+        symbols_data=symbols_data  # NOVO: dados separados por símbolo
     )
 
     if not envs:
         raise ValueError("Não foi possível criar ambientes")
 
-    print(f"🧪 Ambientes ativos: {len(envs)}")
+    print(f"\n🧪 Ambientes criados: {len(envs)} (1 por símbolo)")
+    for env in envs:
+        print(f"  📊 {env.symbol}: {len(env.prices)} candles")
+    
+    # Usar features do primeiro símbolo para dimensionamento das redes
+    # (todas terão as mesmas dimensões de features)
+    sample_macro_features = symbols_data[0]['macro_features']
+    sample_micro_features = symbols_data[0]['micro_features']
     
     # 3. Criar configurações NEAT
     print("\n⚙️  Criando configurações NEAT...")
     
     # Macro: input = macro_features.shape[1], output = dimensão de embedding (ex: 32)
     config_macro = create_neat_config(
-        input_nodes=macro_features.shape[1],
+        input_nodes=sample_macro_features.shape[1],
         output_nodes=32,
         config_name="macro"
     )
     
     # Micro: input = micro_features.shape[1] + 32 (macro embedding) + 2 (pos, cash)
     config_micro = create_neat_config(
-        input_nodes=micro_features.shape[1] + 32 + 2,
+        input_nodes=sample_micro_features.shape[1] + 32 + 2,
         output_nodes=3,  # HOLD, BUY, SELL
         config_name="micro"
     )
@@ -1191,11 +1257,12 @@ def train_asymmetric_neat(
     )
     
     print(f"\n🚀 Iniciando evolução assimétrica por {duration_minutes} minutos...")
-    print(f"📊 Dataset: {len(prices)} candles")
-    print(f"💰 Capital inicial: $10,000")
-    print(f"🧬 População inicial: {population_size} indivíduos (macro + micro)")
+    print(f"📊 Símbolos: {', '.join([env.symbol for env in envs])}")
+    print(f"📈 Avaliação balanceada: TODOS os símbolos testados a cada geração")
+    print(f"💰 Capital inicial: $10,000 por símbolo")
+    print(f"🧬 População inicial: {config_macro.pop_size} indivíduos (macro + micro)")
     print(f"⚙️  Estratégia: 1 macro update : 10 micro updates (ALTA AGILIDADE)")
-    print(f"🧪 Ambientes paralelos: {len(envs)}\n")
+    print(f"🧪 Ambientes paralelos: {len(envs)} (1 por símbolo)\n")
     
     # Multiprocessing ativado!
     print(f"🚀 Usando MULTIPROCESSING com {cpu_count()} workers (paralelização real!)")
@@ -1246,6 +1313,7 @@ def train_asymmetric_neat(
     episode = 0
     recent_portfolios = []
     
+    # Histórico expandido com mais estatísticas
     history = {
         'time_min': [],
         'episode': [],
@@ -1253,10 +1321,41 @@ def train_asymmetric_neat(
         'micro_updates': [],
         'best_macro_fitness': [],
         'best_micro_fitness': [],
-        'avg_reward': []
+        'avg_reward': [],
+        # Estatísticas de população
+        'macro_population_size': [],
+        'micro_population_size': [],
+        'macro_species_count': [],
+        'micro_species_count': [],
+        'macro_avg_fitness': [],
+        'micro_avg_fitness': [],
+        'macro_std_fitness': [],
+        'micro_std_fitness': [],
+        # Dimensões de rede
+        'macro_width': [],
+        'macro_depth': [],
+        'micro_width': [],
+        'micro_depth': [],
+        # Curriculum learning
+        'phase': [],
+        'phase_generation': [],
+        'step_idx': [],
+        # Performance
+        'eval_time_seconds': [],
+        'macro_fitness_improvement': [],
+        'micro_fitness_improvement': []
     }
     
+    # Variáveis para rastrear melhorias
+    last_macro_fitness = -np.inf
+    last_micro_fitness = -np.inf
+    
     table_header_printed = False
+    
+    # Caminho para salvar resultados incrementais
+    results_dir = Path("training_results_asymmetric")
+    results_dir.mkdir(exist_ok=True)
+    csv_path = results_dir / "evolution_table_incremental.csv"
 
     while time.time() < end_time:
         elapsed = time.time() - start_time
@@ -1355,6 +1454,34 @@ def train_asymmetric_neat(
                 f"{macro_width:>6} | {macro_depth:>6} | {micro_width:>6} | {micro_depth:>6}"
             )
             
+            # ════════════════════════════════════════════════════════════════
+            # COLETAR ESTATÍSTICAS COMPLETAS DA GERAÇÃO
+            # ════════════════════════════════════════════════════════════════
+            
+            # Estatísticas de fitness
+            macro_fitnesses = [g.fitness for g in trainer.macro_population.population.values() if g.fitness is not None]
+            micro_fitnesses = [g.fitness for g in trainer.micro_population.population.values() if g.fitness is not None]
+            
+            macro_avg_fitness = np.mean(macro_fitnesses) if macro_fitnesses else 0.0
+            micro_avg_fitness = np.mean(micro_fitnesses) if micro_fitnesses else 0.0
+            macro_std_fitness = np.std(macro_fitnesses) if macro_fitnesses else 0.0
+            micro_std_fitness = np.std(micro_fitnesses) if micro_fitnesses else 0.0
+            
+            # Melhorias desde última geração
+            macro_improvement = best_macro_fitness - last_macro_fitness if last_macro_fitness != -np.inf else 0.0
+            micro_improvement = best_micro_fitness - last_micro_fitness if last_micro_fitness != -np.inf else 0.0
+            
+            last_macro_fitness = best_macro_fitness
+            last_micro_fitness = best_micro_fitness
+            
+            # Estatísticas de espécies
+            macro_species_count = len(trainer.macro_population.species.species)
+            micro_species_count = len(trainer.micro_population.species.species)
+            
+            # Step_idx médio dos ambientes
+            avg_step_idx = np.mean([env.step_idx for env in envs])
+            
+            # Adicionar ao histórico
             history['time_min'].append(elapsed / 60)
             history['episode'].append(episode)
             history['macro_updates'].append(trainer.generation_macro)
@@ -1363,24 +1490,53 @@ def train_asymmetric_neat(
             history['best_micro_fitness'].append(best_micro_fitness)
             history['avg_reward'].append(best_micro_fitness)
             
-            # Adicionar dimensões das redes ao histórico
-            if 'macro_width' not in history:
-                history['macro_width'] = []
-                history['macro_depth'] = []
-                history['micro_width'] = []
-                history['micro_depth'] = []
+            # Estatísticas de população
+            history['macro_population_size'].append(len(trainer.macro_population.population))
+            history['micro_population_size'].append(len(trainer.micro_population.population))
+            history['macro_species_count'].append(macro_species_count)
+            history['micro_species_count'].append(micro_species_count)
+            history['macro_avg_fitness'].append(macro_avg_fitness)
+            history['micro_avg_fitness'].append(micro_avg_fitness)
+            history['macro_std_fitness'].append(macro_std_fitness)
+            history['micro_std_fitness'].append(micro_std_fitness)
             
+            # Dimensões de rede
             history['macro_width'].append(macro_width)
             history['macro_depth'].append(macro_depth)
             history['micro_width'].append(micro_width)
             history['micro_depth'].append(micro_depth)
             
-            # Adicionar info de fase ao histórico
-            if 'phase' not in history:
-                history['phase'] = []
-                history['phase_generation'] = []
+            # Curriculum learning
             history['phase'].append(current_phase['name'])
             history['phase_generation'].append(generations_in_current_phase)
+            history['step_idx'].append(int(avg_step_idx))
+            
+            # Performance
+            history['eval_time_seconds'].append(eval_time)
+            history['macro_fitness_improvement'].append(macro_improvement)
+            history['micro_fitness_improvement'].append(micro_improvement)
+            
+            # ════════════════════════════════════════════════════════════════
+            # SALVAR CSV INCREMENTALMENTE A CADA 50 GERAÇÕES
+            # ════════════════════════════════════════════════════════════════
+            if episode % 50 == 0 or episode == 1:
+                df_history = pd.DataFrame(history)
+                
+                # Se arquivo existe, append; senão, criar novo
+                if csv_path.exists():
+                    df_existing = pd.read_csv(csv_path)
+                    df_combined = pd.concat([df_existing, df_history], ignore_index=True)
+                    # Remover duplicatas baseado em 'episode'
+                    df_combined = df_combined.drop_duplicates(subset=['episode'], keep='last')
+                    df_combined.to_csv(csv_path, index=False)
+                else:
+                    df_history.to_csv(csv_path, index=False)
+                
+                print(f"💾 Checkpoint salvo: {len(df_history)} registros adicionados ao CSV ({csv_path})")
+                
+                # Limpar histórico em memória após salvar (economizar RAM)
+                for key in history:
+                    history[key] = []
             
             last_log_time = current_time
 
