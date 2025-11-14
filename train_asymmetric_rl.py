@@ -211,11 +211,15 @@ class AsymmetricPolicyNetwork(nn.Module):
         
         # ═══════════════════════════════════════════════════════════
         # MICRO PROCESSOR (10 camadas densas, sem convolução)
-        # Arquitetura: Simples e profunda
+        # Arquitetura: Recebe micro_features + macro_embedding
         # ═══════════════════════════════════════════════════════════
+        # Agora macro_embedding (256) também entra na micro
+        # micro_features + macro_embedding → micro_hidden_dim
+        micro_input_dim = micro_features + macro_embedding_dim  # micro_features + 256
+        
         self.micro_processor = nn.Sequential(
-            # Layer 1-2: Input processing
-            nn.Linear(micro_features, micro_hidden_dim),
+            # Layer 1-2: Input processing (combina micro features + macro embedding)
+            nn.Linear(micro_input_dim, micro_hidden_dim),
             nn.LayerNorm(micro_hidden_dim),
             nn.ReLU(),
             nn.Dropout(0.2),
@@ -299,18 +303,25 @@ class AsymmetricPolicyNetwork(nn.Module):
             micro_features: (batch, micro_feature_dim) - contexto curto
             position: (batch,) - posição atual
             cash_ratio: (batch,) - cash / capital
+        
+        Fluxo:
+        1. Macro processa long-term context → macro_emb (256)
+        2. Micro recebe micro_features + macro_emb concatenados
+        3. Decision_head combina tudo para ação final
         """
         # Deep Macro Encoder-Decoder (37 camadas)
         macro_encoded = self.macro_encoder(macro_features)        # 15 camadas
         macro_bottleneck = self.macro_bottleneck(macro_encoded)   # 10 camadas
-        macro_decoded = self.macro_decoder(macro_bottleneck)      # 12 camadas
+        macro_emb = self.macro_decoder(macro_bottleneck)          # 12 camadas → [batch, 256]
         
-        # Deep Micro Processor (10 camadas)
-        micro_feat = self.micro_processor(micro_features)
+        # Deep Micro Processor recebe micro_features + macro_emb concatenados
+        # Macro embedding guia a processamento micro (hierarchical input)
+        micro_input = torch.cat([micro_features, macro_emb], dim=-1)  # [batch, micro_dim+256]
+        micro_feat = self.micro_processor(micro_input)  # 10 camadas
         
         # Combine all
         combined = torch.cat([
-            macro_decoded,
+            macro_emb,
             micro_feat,
             position.unsqueeze(-1),
             cash_ratio.unsqueeze(-1)
@@ -319,7 +330,7 @@ class AsymmetricPolicyNetwork(nn.Module):
         # Decision
         action_probs = self.decision_head(combined)
         
-        return action_probs, macro_decoded
+        return action_probs, macro_emb
 
 
 class TradingEnvironmentRL:
@@ -681,6 +692,7 @@ def create_vectorized_environments(
 def train_asymmetric_rl(
     duration_minutes: int = 10,
     log_interval_seconds: int = 30,
+    portfolio_target: float = 12000.0,
     num_envs: int = 8
 ):
     """
@@ -770,7 +782,8 @@ def train_asymmetric_rl(
     print(f"💰 Capital inicial: $10,000")
     print(f"⚙️  Estratégia: 1 macro update : 10 micro updates (ALTA AGILIDADE)")
     print(f"🧠 Ambientes paralelos: {len(envs)}")
-    print(f"⏰ Log a cada {log_interval_seconds}s\n")
+    print(f"⏰ Log a cada {log_interval_seconds}s")
+    print(f"🎯 Meta de portfolio médio: ${portfolio_target:,.2f}\n")
     
     # Histórico
     history = {
@@ -790,6 +803,8 @@ def train_asymmetric_rl(
     recent_rewards = []
     recent_portfolios = []
     
+    table_header_printed = False
+
     while time.time() < end_time:
         # Decidir quais componentes atualizar
         # Ratio 1:10 → a cada 11 episódios: [M+m, m, m, m, m, m, m, m, m, m, m]
@@ -820,22 +835,24 @@ def train_asymmetric_rl(
         current_time = time.time()
         if current_time - last_log_time >= log_interval_seconds:
             elapsed = current_time - start_time
-            remaining = end_time - current_time
             progress = (elapsed / (duration_minutes * 60)) * 100
             
             avg_reward = np.mean(recent_rewards[-20:]) if recent_rewards else 0
             avg_portfolio = np.mean(recent_portfolios[-20:]) if recent_portfolios else 10000
             avg_return_pct = ((avg_portfolio - 10000) / 10000) * 100
             
-            print(f"\n{'─'*70}")
-            print(f"⏱️  Tempo: {elapsed/60:.1f}min / {duration_minutes}min ({progress:.1f}%)")
-            print(f"🎮 Episódio: {episode}")
-            print(f"🔄 Updates - Macro: {trainer.macro_update_count} | Micro: {trainer.micro_update_count}")
-            print(f"📊 Ratio atual: 1:{trainer.micro_update_count/max(1,trainer.macro_update_count):.1f}")
-            print(f"💰 Portfolio médio: ${avg_portfolio:,.2f} ({avg_return_pct:+.2f}%)")
-            print(f"📈 Reward médio: {avg_reward:.2f}")
-            print(f"⏳ Restante: {remaining/60:.1f}min")
-            print(f"{'─'*70}")
+            if not table_header_printed:
+                print("\nTempo(min) | Episódio | MacroUpd | MicroUpd | Ratio | Portfolio Médio | Δ% | Reward Médio | Gap p/ Meta")
+                print("-" * 105)
+                table_header_printed = True
+
+            ratio = trainer.micro_update_count / max(1, trainer.macro_update_count)
+            gap = avg_portfolio - portfolio_target
+            print(
+                f"{elapsed/60:>9.1f} | {episode:>8} | {trainer.macro_update_count:>8} | "
+                f"{trainer.micro_update_count:>8} | {ratio:>5.1f} | ${avg_portfolio:>14,.2f} | "
+                f"{avg_return_pct:>+6.2f}% | {avg_reward:>11.2f} | ${gap:>10,.2f}"
+            )
             
             # Salvar histórico
             history['time_min'].append(elapsed / 60)
@@ -1179,8 +1196,23 @@ Gânglios Basais (Micro):      Ações habituais rápidas
 
 
 if __name__ == "__main__":
-    train_asymmetric_rl(
-        duration_minutes=10,
-        log_interval_seconds=30,
-        num_envs=8
-    )
+    import os
+    # Prefer MPS on Apple Silicon, fall back to config.device
+    preferred_device = "mps" if torch.backends.mps.is_available() else config.device
+    try:
+        config.device = preferred_device
+    except Exception:
+        pass
+
+    # Tune threads for preprocessing
+    try:
+        torch.set_num_threads(os.cpu_count() or 4)
+    except Exception:
+        pass
+
+    print(f"⚙️  Dispositivo preferido: {preferred_device}")
+
+    # Incremental runs to benchmark scalability: increase num_envs stepwise
+    env_steps = [8, 16, 32, 64]
+    train_asymmetric_rl(duration_minutes=999.9, log_interval_seconds=20, num_envs=25)
+    
