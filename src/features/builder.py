@@ -10,6 +10,23 @@ logger = get_logger(__name__)
 class FeatureBuilder:
     """Generate technical features from candle data"""
     
+    def add_features(
+        self,
+        df: pd.DataFrame,
+        volatility_windows: list = [12, 24, 48],
+        volume_window: int = 24,
+        price_window: int = 24,
+        drop_na: bool = True
+    ) -> pd.DataFrame:
+        """Backward compatible wrapper for build_features."""
+        return self.build_features(
+            df=df,
+            volatility_windows=volatility_windows,
+            volume_window=volume_window,
+            price_window=price_window,
+            drop_na=drop_na
+        )
+    
     @staticmethod
     def log_returns(close: pd.Series) -> pd.Series:
         """Log returns: log(close_t / close_{t-1})"""
@@ -156,6 +173,16 @@ class FeatureBuilder:
                 normalized[col] = (normalized[col] - col_mean) / (col_std + 1e-8)
         
         return normalized
+
+    # NOTE: alguns scripts antigos ainda chamam add_features. Mantemos um alias
+    # para garantir compatibilidade sem duplicar lógica.
+    def add_features(
+        self,
+        df: pd.DataFrame,
+        **kwargs
+    ) -> pd.DataFrame:
+        """Backward-compatible alias for build_features."""
+        return self.build_features(df, **kwargs)
 
 if __name__ == "__main__":
     # Example usage

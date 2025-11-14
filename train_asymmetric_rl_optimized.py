@@ -884,7 +884,7 @@ def prepare_asymmetric_data(
 def train_optimized_asymmetric_rl(
     duration_minutes: int = 10,
     log_interval_seconds: int = 30,
-    num_envs: int = 32
+    num_envs: int = 64
 ):
     """
     Treinar com TODAS as otimizações para M2
@@ -905,40 +905,31 @@ def train_optimized_asymmetric_rl(
     print("="*70 + "\n")
     
     # 1. Carregar dados de 2024
-    print("📅 Carregando dados de 2024 (persistência ativada)...")
-    from src.ingest.binance import BinanceIngestor
+    print("📅 Carregando dados de 2024 a partir do parquet local...")
     from src.features.builder import FeatureBuilder
 
-    ingestor = BinanceIngestor()
+    data_path = Path("data/timeframe=5m/symbol=BTCUSDT/candles.parquet")
+    if not data_path.exists():
+        raise FileNotFoundError(
+            f"Arquivo de candles não encontrado em {data_path.resolve()}"
+        )
 
-    # Check if we have enough historical data, if not force download
-    min_required_samples = 1000  # Need enough data for training
-    
-    print("🔍 Verificando dados existentes...")
-    df_all = ingestor.load_from_parquet(symbol="BTCUSDT", interval="5m")
-    
-    if df_all.empty:
-        print("🟡 Arquivo parquet não encontrado — baixando candles do Binance...")
-        df_all = ingestor.ingest_symbol(symbol="BTCUSDT", interval="5m", days_back=365)
-    elif len(df_all) < min_required_samples:
-        print(f"🟡 Dados insuficientes no parquet ({len(df_all)} < {min_required_samples}) — baixando dados históricos...")
-        df_all = ingestor.ingest_symbol(symbol="BTCUSDT", interval="5m", days_back=365)
-    else:
-        print("✅ Dados carregados de parquet local.")
-        # Check if data is too old or recent, we need 2024 data for training
-        min_date = df_all['timestamp'].min()
-        max_date = df_all['timestamp'].max()
-        
-        # If we don't have 2024 data, download historical data
-        if min_date.year > 2024 or max_date.year < 2024:
-            print(f"🟡 Dados não cobrem 2024 (range: {min_date.date()} to {max_date.date()}) — baixando dados históricos...")
-            df_all = ingestor.ingest_symbol(symbol="BTCUSDT", interval="5m", days_back=730)  # 2 years back
-    
+    df_all = pd.read_parquet(data_path, engine="pyarrow")
+    if 'timestamp' not in df_all.columns:
+        raise KeyError("Coluna 'timestamp' ausente no parquet de candles")
+
+    df_all = df_all.sort_values('timestamp').reset_index(drop=True)
+
+    # Normalizar colunas principais que podem chegar como string
+    base_numeric_cols = ['open', 'high', 'low', 'close', 'volume', 'quote_volume']
+    for col in base_numeric_cols:
+        if col in df_all.columns:
+            df_all[col] = pd.to_numeric(df_all[col], errors='coerce')
+
     print(f"📊 df_all shape: {df_all.shape}")
     if df_all.empty:
-        print("❌ ERRO: Falha ao carregar/baixar dados!")
-        return
-        
+        raise ValueError("Parquet de candles está vazio")
+    
     print(f"   Timestamp range: {df_all['timestamp'].min()} to {df_all['timestamp'].max()}")
     print(f"   Columns: {list(df_all.columns)}")
 
@@ -960,8 +951,9 @@ def train_optimized_asymmetric_rl(
         print(f"⚠️  Usando {len(df_train)} candles mais antigos disponíveis para treinamento")
         print(f"   (Sem dados suficientes de 2024: {len(df_2024)} candles)")
     else:
-        print(f"❌ ERRO: Dados insuficientes mesmo após download ({len(df_all)} < {min_samples_needed})")
-        return
+        raise ValueError(
+            f"Dados insuficientes no parquet ({len(df_all)} < {min_samples_needed}) para preparar macro window"
+        )
     
     print(f"   Training data range: {df_train['timestamp'].min()} to {df_train['timestamp'].max()}")
 
@@ -1235,5 +1227,5 @@ if __name__ == "__main__":
     train_optimized_asymmetric_rl(
         duration_minutes=10,
         log_interval_seconds=30,
-        num_envs=32  # Reduzindo para debug - era 32
+        num_envs=64  # Aumentado para melhor uso do M2
     )

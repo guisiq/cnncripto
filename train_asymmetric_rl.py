@@ -64,56 +64,56 @@ class AsymmetricPolicyNetwork(nn.Module):
         self.macro_encoder = nn.Sequential(
             # Stage 1: Input projection (512)
             nn.Linear(macro_features, 512),
-            nn.BatchNorm1d(512),
+            nn.LayerNorm(512),
             nn.ReLU(),
             nn.Dropout(0.1),
             
             # Stage 2: Deep processing (512 → 512) - 4 blocos residuais
             nn.Linear(512, 512),
-            nn.BatchNorm1d(512),
+            nn.LayerNorm(512),
             nn.ReLU(),
             nn.Dropout(0.1),
             
             nn.Linear(512, 512),
-            nn.BatchNorm1d(512),
+            nn.LayerNorm(512),
             nn.ReLU(),
             nn.Dropout(0.1),
             
             nn.Linear(512, 512),
-            nn.BatchNorm1d(512),
+            nn.LayerNorm(512),
             nn.ReLU(),
             nn.Dropout(0.1),
             
             nn.Linear(512, 512),
-            nn.BatchNorm1d(512),
+            nn.LayerNorm(512),
             nn.ReLU(),
             nn.Dropout(0.1),
             
             # Stage 3: Compress to 256
             nn.Linear(512, 256),
-            nn.BatchNorm1d(256),
+            nn.LayerNorm(256),
             nn.ReLU(),
             nn.Dropout(0.15),
             
             # Stage 4: Deep 256 (3 blocos)
             nn.Linear(256, 256),
-            nn.BatchNorm1d(256),
+            nn.LayerNorm(256),
             nn.ReLU(),
             nn.Dropout(0.15),
             
             nn.Linear(256, 256),
-            nn.BatchNorm1d(256),
+            nn.LayerNorm(256),
             nn.ReLU(),
             nn.Dropout(0.15),
             
             nn.Linear(256, 256),
-            nn.BatchNorm1d(256),
+            nn.LayerNorm(256),
             nn.ReLU(),
             nn.Dropout(0.15),
             
             # Stage 5: Compress to 128
             nn.Linear(256, 128),
-            nn.BatchNorm1d(128),
+            nn.LayerNorm(128),
             nn.ReLU(),
             nn.Dropout(0.2),
         )
@@ -125,40 +125,40 @@ class AsymmetricPolicyNetwork(nn.Module):
         self.macro_bottleneck = nn.Sequential(
             # Compress deep
             nn.Linear(128, 64),
-            nn.BatchNorm1d(64),
+            nn.LayerNorm(64),
             nn.ReLU(),
             nn.Dropout(0.2),
             
             nn.Linear(64, 64),
-            nn.BatchNorm1d(64),
+            nn.LayerNorm(64),
             nn.ReLU(),
             nn.Dropout(0.2),
             
             # Extreme bottleneck
             nn.Linear(64, 32),
-            nn.BatchNorm1d(32),
+            nn.LayerNorm(32),
             nn.ReLU(),
             nn.Dropout(0.25),
             
             nn.Linear(32, 32),
-            nn.BatchNorm1d(32),
+            nn.LayerNorm(32),
             nn.ReLU(),
             nn.Dropout(0.25),
             
             # Start expansion
             nn.Linear(32, 64),
-            nn.BatchNorm1d(64),
+            nn.LayerNorm(64),
             nn.ReLU(),
             nn.Dropout(0.2),
             
             nn.Linear(64, 64),
-            nn.BatchNorm1d(64),
+            nn.LayerNorm(64),
             nn.ReLU(),
             nn.Dropout(0.2),
             
             # Expand to 128
             nn.Linear(64, 128),
-            nn.BatchNorm1d(128),
+            nn.LayerNorm(128),
             nn.ReLU(),
             nn.Dropout(0.2),
         )
@@ -170,40 +170,40 @@ class AsymmetricPolicyNetwork(nn.Module):
         self.macro_decoder = nn.Sequential(
             # Stage 1: Deep 128 (2 blocos)
             nn.Linear(128, 128),
-            nn.BatchNorm1d(128),
+            nn.LayerNorm(128),
             nn.ReLU(),
             nn.Dropout(0.15),
             
             nn.Linear(128, 128),
-            nn.BatchNorm1d(128),
+            nn.LayerNorm(128),
             nn.ReLU(),
             nn.Dropout(0.15),
             
             # Stage 2: Expand to 256
             nn.Linear(128, 256),
-            nn.BatchNorm1d(256),
+            nn.LayerNorm(256),
             nn.ReLU(),
             nn.Dropout(0.15),
             
             # Stage 3: Deep 256 (3 blocos)
             nn.Linear(256, 256),
-            nn.BatchNorm1d(256),
+            nn.LayerNorm(256),
             nn.ReLU(),
             nn.Dropout(0.15),
             
             nn.Linear(256, 256),
-            nn.BatchNorm1d(256),
+            nn.LayerNorm(256),
             nn.ReLU(),
             nn.Dropout(0.15),
             
             nn.Linear(256, 256),
-            nn.BatchNorm1d(256),
+            nn.LayerNorm(256),
             nn.ReLU(),
             nn.Dropout(0.15),
             
             # Stage 4: Final projection
             nn.Linear(256, macro_embedding_dim),
-            nn.BatchNorm1d(macro_embedding_dim),
+            nn.LayerNorm(macro_embedding_dim),
             nn.ReLU(),
         )
         
@@ -216,51 +216,51 @@ class AsymmetricPolicyNetwork(nn.Module):
         self.micro_processor = nn.Sequential(
             # Layer 1-2: Input processing
             nn.Linear(micro_features, micro_hidden_dim),
-            nn.BatchNorm1d(micro_hidden_dim),
+            nn.LayerNorm(micro_hidden_dim),
             nn.ReLU(),
             nn.Dropout(0.2),
             
             nn.Linear(micro_hidden_dim, micro_hidden_dim),
-            nn.BatchNorm1d(micro_hidden_dim),
+            nn.LayerNorm(micro_hidden_dim),
             nn.ReLU(),
             nn.Dropout(0.2),
             
             # Layer 3-4: Deep processing
             nn.Linear(micro_hidden_dim, micro_hidden_dim),
-            nn.BatchNorm1d(micro_hidden_dim),
+            nn.LayerNorm(micro_hidden_dim),
             nn.ReLU(),
             nn.Dropout(0.2),
             
             nn.Linear(micro_hidden_dim, micro_hidden_dim),
-            nn.BatchNorm1d(micro_hidden_dim),
+            nn.LayerNorm(micro_hidden_dim),
             nn.ReLU(),
             nn.Dropout(0.2),
             
             # Layer 5-6: Compression start
             nn.Linear(micro_hidden_dim, micro_hidden_dim // 2),
-            nn.BatchNorm1d(micro_hidden_dim // 2),
+            nn.LayerNorm(micro_hidden_dim // 2),
             nn.ReLU(),
             nn.Dropout(0.2),
             
             nn.Linear(micro_hidden_dim // 2, micro_hidden_dim // 2),
-            nn.BatchNorm1d(micro_hidden_dim // 2),
+            nn.LayerNorm(micro_hidden_dim // 2),
             nn.ReLU(),
             nn.Dropout(0.2),
             
             # Layer 7-8: Further compression
             nn.Linear(micro_hidden_dim // 2, micro_hidden_dim // 4),
-            nn.BatchNorm1d(micro_hidden_dim // 4),
+            nn.LayerNorm(micro_hidden_dim // 4),
             nn.ReLU(),
             nn.Dropout(0.2),
             
             nn.Linear(micro_hidden_dim // 4, micro_hidden_dim // 4),
-            nn.BatchNorm1d(micro_hidden_dim // 4),
+            nn.LayerNorm(micro_hidden_dim // 4),
             nn.ReLU(),
             nn.Dropout(0.2),
             
             # Layer 9-10: Final projection
             nn.Linear(micro_hidden_dim // 4, micro_hidden_dim // 4),
-            nn.BatchNorm1d(micro_hidden_dim // 4),
+            nn.LayerNorm(micro_hidden_dim // 4),
             nn.ReLU(),
         )
         
@@ -274,17 +274,17 @@ class AsymmetricPolicyNetwork(nn.Module):
         
         self.decision_head = nn.Sequential(
             nn.Linear(combined_dim, 256),
-            nn.BatchNorm1d(256),
+            nn.LayerNorm(256),
             nn.ReLU(),
             nn.Dropout(0.2),
             
             nn.Linear(256, 128),
-            nn.BatchNorm1d(128),
+            nn.LayerNorm(128),
             nn.ReLU(),
             nn.Dropout(0.2),
             
             nn.Linear(128, 64),
-            nn.BatchNorm1d(64),
+            nn.LayerNorm(64),
             nn.ReLU(),
             nn.Dropout(0.2),
             
@@ -638,9 +638,50 @@ def prepare_asymmetric_data(
     return prices_array, macro_features, micro_features
 
 
+def create_vectorized_environments(
+    prices: np.ndarray,
+    macro_features: np.ndarray,
+    micro_features: np.ndarray,
+    num_envs: int,
+    initial_capital: float,
+    commission: float
+) -> List[TradingEnvironmentRL]:
+    """Divide o dataset em fatias para múltiplos ambientes."""
+    total_samples = len(prices)
+    if total_samples < 2:
+        return []
+
+    max_envs = max(1, min(num_envs, total_samples // 600))
+    if max_envs < num_envs:
+        print(
+            f"⚠️  Ajustando num_envs de {num_envs} para {max_envs} devido ao tamanho do dataset"
+        )
+
+    chunk_size = total_samples // max_envs
+    environments: List[TradingEnvironmentRL] = []
+
+    for env_idx in range(max_envs):
+        start = env_idx * chunk_size
+        end = total_samples if env_idx == max_envs - 1 else (env_idx + 1) * chunk_size
+        if end - start < 2:
+            continue
+
+        env = TradingEnvironmentRL(
+            prices=prices[start:end],
+            macro_features=macro_features[start:end],
+            micro_features=micro_features[start:end],
+            initial_capital=initial_capital,
+            commission=commission
+        )
+        environments.append(env)
+
+    return environments
+
+
 def train_asymmetric_rl(
     duration_minutes: int = 10,
-    log_interval_seconds: int = 30
+    log_interval_seconds: int = 30,
+    num_envs: int = 8
 ):
     """
     Treinar com updates assimétricos:
@@ -654,19 +695,40 @@ def train_asymmetric_rl(
     print("="*70 + "\n")
     
     # 1. Carregar dados de 2024
-    print("📅 Carregando dados de 2024...")
-    from src.ingest.binance import BinanceIngestor
+    print("📅 Carregando dados de 2024 a partir do parquet local...")
     from src.features.builder import FeatureBuilder
-    
-    ingestor = BinanceIngestor()
-    df = ingestor.fetch_candles("BTCUSDT", days_back=365)
-    
-    # Binance retorna 'timestamp' ao invés de 'open_time'
+
+    data_path = Path("data/timeframe=5m/symbol=BTCUSDT/candles.parquet")
+    if not data_path.exists():
+        raise FileNotFoundError(
+            f"Arquivo de candles não encontrado em {data_path.resolve()}"
+        )
+
+    df = pd.read_parquet(data_path, engine="pyarrow")
+    if 'timestamp' not in df.columns:
+        raise KeyError("Coluna 'timestamp' ausente no parquet de candles")
+
+    df['timestamp'] = pd.to_datetime(df['timestamp'])
+    df = df.sort_values('timestamp').reset_index(drop=True)
+
+    # Normalizar colunas que podem ter vindo como string
+    numeric_cols = [
+        'open', 'high', 'low', 'close', 'volume', 'quote_volume',
+        'trades_count', 'taker_buy_volume'
+    ]
+    for col in numeric_cols:
+        if col in df.columns:
+            df[col] = pd.to_numeric(df[col], errors='coerce')
+
+    # Filtrar ano de 2024
     df_2024 = df[
         (df['timestamp'] >= datetime(2024, 1, 1)) &
         (df['timestamp'] < datetime(2025, 1, 1))
     ].copy()
-    
+
+    if df_2024.empty:
+        raise ValueError("Dataset de 2024 está vazio após o filtro por timestamp")
+
     builder = FeatureBuilder()
     df_2024 = builder.add_features(df_2024)
     
@@ -679,16 +741,21 @@ def train_asymmetric_rl(
         micro_window=60
     )
     
-    # 3. Criar ambiente
-    env = TradingEnvironmentRL(
+    envs = create_vectorized_environments(
         prices=prices,
         macro_features=macro_features,
         micro_features=micro_features,
+        num_envs=num_envs,
         initial_capital=10000.0,
         commission=0.001
     )
+
+    if not envs:
+        raise ValueError("Não foi possível criar ambientes para treino (dataset insuficiente)")
+
+    print(f"🧪 Ambientes ativos: {len(envs)} (solicitados {num_envs})")
     
-    # 4. Criar trainer
+    # 3. Criar trainer
     trainer = AsymmetricRLTrainer(
         macro_features_dim=macro_features.shape[1],
         micro_features_dim=micro_features.shape[1],
@@ -702,6 +769,7 @@ def train_asymmetric_rl(
     print(f"📊 Dataset: {len(prices)} candles")
     print(f"💰 Capital inicial: $10,000")
     print(f"⚙️  Estratégia: 1 macro update : 10 micro updates (ALTA AGILIDADE)")
+    print(f"🧠 Ambientes paralelos: {len(envs)}")
     print(f"⏰ Log a cada {log_interval_seconds}s\n")
     
     # Histórico
@@ -737,8 +805,9 @@ def train_asymmetric_rl(
             update_micro = True
         
         # Treinar episódio
+        current_env = envs[episode % len(envs)]
         total_reward, final_portfolio = trainer.train_episode(
-            env,
+            current_env,
             update_macro=update_macro,
             update_micro=update_micro
         )
@@ -1112,5 +1181,6 @@ Gânglios Basais (Micro):      Ações habituais rápidas
 if __name__ == "__main__":
     train_asymmetric_rl(
         duration_minutes=10,
-        log_interval_seconds=30
+        log_interval_seconds=30,
+        num_envs=8
     )
