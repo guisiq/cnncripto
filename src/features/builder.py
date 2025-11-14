@@ -128,6 +128,26 @@ class FeatureBuilder:
             window=price_window
         )
         features = pd.concat([features, price_feats], axis=1)
+
+        # --- Additional lightweight technical features ---
+        # Simple moving averages (short / medium)
+        features['sma_5'] = features['close'].rolling(window=5).mean()
+        features['sma_10'] = features['close'].rolling(window=10).mean()
+
+        # Exponential moving average (medium)
+        features['ema_10'] = features['close'].ewm(span=10, adjust=False).mean()
+
+        # RSI (14)
+        delta = features['close'].diff()
+        up = delta.clip(lower=0)
+        down = -1 * delta.clip(upper=0)
+        roll_up = up.rolling(window=14).mean()
+        roll_down = down.rolling(window=14).mean()
+        rs = roll_up / (roll_down + 1e-8)
+        features['rsi_14'] = 100.0 - (100.0 / (1.0 + rs))
+
+        # Momentum (difference over 10 periods)
+        features['momentum_10'] = features['close'] - features['close'].shift(10)
         
         if drop_na:
             features = features.dropna()

@@ -598,7 +598,12 @@ def train_micronet_recurrent(
         {'name': 'Elite 17',      'generations': 50, 'steps_multiplier': 2.85, 'jump_candles': 12},
         {'name': 'Elite 18',      'generations': 50, 'steps_multiplier': 2.90, 'jump_candles': 10},
         {'name': 'Elite 19',      'generations': 50, 'steps_multiplier': 2.95, 'jump_candles': 9},
-        {'name': 'Elite 20',      'generations': 50, 'steps_multiplier': 3.00, 'jump_candles': 8}
+        {'name': 'Elite 20',      'generations': 50, 'steps_multiplier': 3.00, 'jump_candles': 8},
+        {'name': 'Elite 21',      'generations': 55, 'steps_multiplier': 3.05, 'jump_candles': 10},
+        {'name': 'Elite 22',      'generations': 20, 'steps_multiplier': 1.30, 'jump_candles': 10},
+        {'name': 'Elite 23',      'generations': 70, 'steps_multiplier': 3.15, 'jump_candles': 10},
+        {'name': 'Elite 24',      'generations': 75, 'steps_multiplier': 3.20, 'jump_candles': 10},
+        {'name': 'Elite 25',      'generations': 80, 'steps_multiplier': 3.25, 'jump_candles': 10}
     ]
     
     print("\n" + "="*70)
@@ -799,24 +804,22 @@ def train_micronet_recurrent(
         current_jump_candles = current_phase['jump_candles']
         
         # Verificar se deve avançar para próxima fase
-        if generations_in_current_phase >= current_phase['generations']:
+        # (usar '>' para garantir que a geração final da fase seja executada com os parâmetros da fase)
+        if generations_in_current_phase > current_phase['generations']:
             # Avançar step_idx com overlap de 80%
             overlap_ratio = 0.8
             phase_advance_candles = int(current_jump_candles * current_phase['generations'] * overlap_ratio)
             phase_start_step_idx += phase_advance_candles
-            
+
             # Aplicar novo step_idx a todos os ambientes
             for env in envs:
                 env.step_idx = min(phase_start_step_idx, len(env.prices) - 1)
-            
+
             # Avançar para próxima fase se disponível
             if current_phase_idx < len(curriculum_phases) - 1:
                 current_phase_idx += 1
                 generations_in_current_phase = 0
-                print(f"\n🎓 AVANÇANDO PARA FASE {current_phase_idx + 1}: {curriculum_phases[current_phase_idx]['name']}")
-                print(f"   Novo horizonte: {curriculum_phases[current_phase_idx]['generations']} gerações")
-                print(f"   Novo steps: {int(max_steps * curriculum_phases[current_phase_idx]['steps_multiplier'])}")
-                print(f"   Novo jump: {curriculum_phases[current_phase_idx]['jump_candles']} candles\n")
+
             else:
                 # Última fase: apenas resetar contador
                 generations_in_current_phase = 0
@@ -898,7 +901,8 @@ def train_micronet_recurrent(
             # Salvar CSV a cada 50 gerações
             if generation % 50 == 0:
                 df_history = pd.DataFrame(history)
-                df_history.to_csv(csv_path, index=False)
+                # Append to existing CSV instead of overwriting. Write header only if file doesn't exist.
+                df_history.to_csv(csv_path, mode='a', header=not csv_path.exists(), index=False)
                 print(f"💾 Checkpoint salvo: {csv_path}")
                 
                 # Limpar histórico em memória
@@ -918,7 +922,8 @@ def train_micronet_recurrent(
     # Salvar CSV final
     if history['generation']:
         df_history = pd.DataFrame(history)
-        df_history.to_csv(csv_path, index=False)
+        # Append final rows to CSV; write header only if file missing
+        df_history.to_csv(csv_path, mode='a', header=not csv_path.exists(), index=False)
     
     # Salvar melhor genoma
     best_genome_id = max(
@@ -945,5 +950,5 @@ if __name__ == "__main__":
         duration_minutes=60*6,  # 6 horas de treinamento
         log_interval_seconds=120,
         max_steps=20,  # 144 steps × 5min = 720min = 12 horas
-        pop_size=50  # População de 170 indivíduos
+        pop_size=100  # População de 170 indivíduos
     )

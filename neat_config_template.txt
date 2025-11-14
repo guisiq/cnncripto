@@ -32,12 +32,12 @@ compatibility_disjoint_coefficient = 1.0
 compatibility_weight_coefficient   = 0.5
 
 # connection add/remove rates
-conn_add_prob           = 0.8
-conn_delete_prob        = 0.2
+conn_add_prob           = 0.95
+conn_delete_prob        = 0.5
 
 # node add/remove rates
-node_add_prob           = 0.3
-node_delete_prob        = 0.1
+node_add_prob           = 0.8
+node_delete_prob        = 0.4
 
 # network parameters
 num_hidden              = 3
