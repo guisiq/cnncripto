@@ -429,7 +429,7 @@ class AsymmetricNEATTrainer:
         avg_portfolio = 10000  # Não usado mais
         avg_step_reward = total_return / max(1, num_envs)
         return fitness, avg_portfolio, avg_step_reward
-    
+
     def eval_micro_genome(
         self,
         macro_genome: neat.DefaultGenome,
@@ -440,63 +440,63 @@ class AsymmetricNEATTrainer:
         """
         Avaliar fitness de um genoma MicroNet.
         Usa melhor MacroNet como contexto.
-        
+
         Args:
             macro_genome: melhor genoma MacroNet (fixa)
             micro_genome: genoma MicroNet a avaliar
             envs: lista de ambientes
-        
+
         Returns:
             fitness (média de retorno %)
         """
         total_return = 0.0
         num_envs = 0
-        
+
         # Criar redes NEAT uma vez (OTIMIZAÇÃO!)
         macro_net = neat.nn.FeedForwardNetwork.create(macro_genome, self.config_macro)
         micro_net = neat.nn.FeedForwardNetwork.create(micro_genome, self.config_micro)
-        
+
         # 🔍 Debug: coletar estatísticas de saída da rede
         all_predictions = []
-        
+
         for env in envs:
             state = env.reset()
             total_reward = 0.0
             steps = 0
-            
+
             while steps < max_steps:
                 # Macro: usar rede já criada
                 macro_output = np.asarray(macro_net.activate(state['macro_features']), dtype=np.float32)
-                
+
                 # Micro: recebe micro_features + macro_output concatenados
                 micro_input = np.concatenate([
                     state['micro_features'],
                     macro_output,
                     [state['position'], state['cash'] / 10000.0]
                 ])
-                
+
                 micro_output = np.asarray(micro_net.activate(micro_input), dtype=np.float32)
-                
+
                 # Usar saída bruta da rede como previsão (-1 a +1)
                 prediction_value = float(micro_output[0])
                 all_predictions.append(prediction_value)
-                
+
                 # Ação: argmax de micro output (mantido para compatibilidade, mas não usado no reward)
                 action = np.argmax(micro_output) % 3
-                
+
                 next_state, reward, done = env.step(action, prediction_value)
                 total_reward += reward
                 steps += 1
-                
+
                 if done or next_state is None:
                     break
-                
+
                 state = next_state
-            
+
             # Fitness = reward acumulado
             total_return += total_reward
             num_envs += 1
-        
+
         fitness = total_return / max(1, num_envs)
         avg_portfolio = 10000  # Não usado mais
         avg_step_reward = total_return / max(1, num_envs)
@@ -572,10 +572,18 @@ class AsymmetricNEATTrainer:
                     max_steps=max_steps
                 )
                 results = pool.map(eval_func, list(macro_genomes.items()))
-            
+
+            # Depuração: snapshot antes
+            macro_ids_before = set(self.macro_population.population.keys())
             # Atualizar fitness nos genomas originais da população
             for genome_id, genome_result, fitness in results:
-                self.macro_population.population[genome_id].fitness = fitness
+                try:
+                    self.macro_population.population[genome_id].fitness = fitness
+                except Exception:
+                    pass
+
+            # Depuração: estatísticas de fitness após avaliação
+            macro_fitnesses = [g.fitness for g in self.macro_population.population.values() if g.fitness is not None]
         else:
             # Sequencial
             for idx, (gid, genome) in enumerate(macro_genomes.items(), 1):
@@ -601,6 +609,8 @@ class AsymmetricNEATTrainer:
         best_macro_genome_id = max(self.macro_population.population, key=lambda g: self.macro_population.population[g].fitness or -np.inf)
         best_macro = self.macro_population.population[best_macro_genome_id]
         total_genomes_micro = len(micro_genomes)
+        # Depuração: snapshot IDs micro antes da avaliação
+        micro_ids_before = set(self.micro_population.population.keys())
 
         if use_multiprocessing and total_genomes_micro > 1:
             with Pool(processes=cpu_count()) as pool:
@@ -616,7 +626,11 @@ class AsymmetricNEATTrainer:
             
             # Atualizar fitness nos genomas originais da população
             for genome_id, genome_result, fitness in results:
-                self.micro_population.population[genome_id].fitness = fitness
+                try:
+                    self.micro_population.population[genome_id].fitness = fitness
+                except Exception:
+                    pass
+
         else:
             # Sequencial
             for idx, (gid, genome) in enumerate(micro_genomes.items(), 1):
@@ -640,29 +654,53 @@ class AsymmetricNEATTrainer:
         # Agora todos os genomas têm fitness fresh da avaliação acima
         # ─────────────────────────────────────────────────────────────
         if update_macro:
-            # Limpar espécies vazias antes de reproduzir
+            # Limpar espécies vazias
             self.macro_population.species.species = {
                 sid: s for sid, s in self.macro_population.species.species.items()
                 if len(s.members) > 0
             }
-            
-            self.macro_population.reproduction.reproduce(
-                self.config_macro, self.macro_population.species,
-                self.config_macro.pop_size, self.generation_macro
+
+            # Corrigido: Capturar a nova população retornada pela reprodução
+            new_pop = self.macro_population.reproduction.reproduce(
+                self.config_macro,
+                self.macro_population.species,
+                self.config_macro.pop_size,
+                self.generation_macro
             )
+            self.macro_population.population = new_pop
+
+            # Corrigido: Re-especiar a nova população para a próxima geração
+            self.macro_population.species.speciate(
+                self.config_macro,
+                self.macro_population.population,
+                self.generation_macro
+            )
+
             self.generation_macro += 1
-        
+
         if update_micro:
-            # Limpar espécies vazias antes de reproduzir
+            # Limpar espécies vazias
             self.micro_population.species.species = {
                 sid: s for sid, s in self.micro_population.species.species.items()
                 if len(s.members) > 0
             }
-            
-            self.micro_population.reproduction.reproduce(
-                self.config_micro, self.micro_population.species,
-                self.config_micro.pop_size, self.generation_micro
+
+            # Corrigido: Capturar a nova população retornada pela reprodução
+            new_pop = self.micro_population.reproduction.reproduce(
+                self.config_micro,
+                self.micro_population.species,
+                self.config_micro.pop_size,
+                self.generation_micro
             )
+            self.micro_population.population = new_pop
+
+            # Corrigido: Re-especiar a nova população para a próxima geração
+            self.micro_population.species.speciate(
+                self.config_micro,
+                self.micro_population.population,
+                self.generation_micro
+            )
+
             self.generation_micro += 1
         
         eval_total_time = time.time() - eval_start_time
@@ -1193,37 +1231,65 @@ def plot_neat_evolution(history: dict, output_dir: Path, total_time: float, epis
 
 if __name__ == "__main__":
     import os
+    import subprocess
     
-    # Setup MPS
+    # Prevenir que o Mac entre em sleep (caffeinate)
     print("\n" + "="*70)
-    print("  ⚙️  CONFIGURAÇÃO DE DISPOSITIVO")
+    print("  🔋 PREVENINDO SLEEP DO MAC (caffeinate)")
     print("="*70)
-    
-    mps_available = torch.backends.mps.is_available()
-    print(f"🔍 MPS disponível: {mps_available}")
-    
-    if mps_available:
-        mps_built = torch.backends.mps.is_built()
-        print(f"🔧 PyTorch compilado com MPS: {mps_built}")
-        if mps_built:
-            print(f"✅ Usando MPS (Metal Performance Shaders)")
-            config.device = "mps"
+    caffeinate_proc = None
+    try:
+        try:
+            caffeinate_proc = subprocess.Popen([
+                'caffeinate', '-dimsu'
+            ], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            print(f"✅ Caffeinate ativado (PID: {caffeinate_proc.pid})")
+            print("⚡ Mac NÃO entrará em sleep durante o treinamento. Feche a tampa se desejar (conecte o carregador).")
+        except Exception as e:
+            caffeinate_proc = None
+            print(f"⚠️  Não foi possível ativar caffeinate automaticamente: {e}")
+            print("   Execute manualmente: caffeinate -dimsu &")
+
+        # Setup MPS
+        print("\n" + "="*70)
+        print("  ⚙️  CONFIGURAÇÃO DE DISPOSITIVO")
+        print("="*70)
+        
+        mps_available = torch.backends.mps.is_available()
+        print(f"🔍 MPS disponível: {mps_available}")
+        
+        if mps_available:
+            mps_built = torch.backends.mps.is_built()
+            print(f"🔧 PyTorch compilado com MPS: {mps_built}")
+            if mps_built:
+                print(f"✅ Usando MPS (Metal Performance Shaders)")
+                config.device = "mps"
+            else:
+                print(f"⚠️  PyTorch sem suporte MPS, usando CPU")
+                config.device = "cpu"
         else:
-            print(f"⚠️  PyTorch sem suporte MPS, usando CPU")
+            print(f"ℹ️  MPS não disponível, usando CPU")
             config.device = "cpu"
-    else:
-        print(f"ℹ️  MPS não disponível, usando CPU")
-        config.device = "cpu"
-    
-    torch.set_num_threads(os.cpu_count() or 4)
-    print(f"✅ Threads CPU: {os.cpu_count() or 4}")
-    print("="*70 + "\n")
-    
-    # Rodar treinamento NEAT assimétrico
-    train_asymmetric_neat(
-        duration_minutes=999.9,
-        log_interval_seconds=30,
-        portfolio_target=12000.0,
-        num_envs=8,
-        population_size=50
-    )
+        
+        torch.set_num_threads(os.cpu_count() or 4)
+        print(f"✅ Threads CPU: {os.cpu_count() or 4}")
+        print("="*70 + "\n")
+        
+        # Rodar treinamento NEAT assimétrico
+        train_asymmetric_neat(
+            duration_minutes=337.9,
+            log_interval_seconds=30,
+            portfolio_target=12000.0,
+            num_envs=8,
+            population_size=50
+        )
+    finally:
+        # Finalizar caffeinate se foi iniciado
+        if caffeinate_proc is not None:
+            try:
+                print(f"\n🛑 Finalizando caffeinate (PID: {caffeinate_proc.pid})")
+                caffeinate_proc.terminate()
+                caffeinate_proc.wait(timeout=5)
+                print("✅ Caffeinate finalizado")
+            except Exception:
+                pass
