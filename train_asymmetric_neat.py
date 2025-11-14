@@ -4,8 +4,14 @@ Pipeline de Treinamento Assimétrico com NEAT (NeuroEvolution of Augmenting Topo
 Estratégia:
 - MacroNet NEAT: Rede que evolui topologia (long-term, 41h)
 - MicroNet NEAT: Rede que evolui topologia (short-term, 5h)
-- Evolução assimétrica: Macro treina a cada 2 gerações, Micro treina a cada geração
+- Evolução assimétrica: Macro evolui 1x a cada 10 episódios, Micro evolui 1x por episódio
+- Ratio: 1:10 (extremamente ágil, seguindo padrão do RL)
 - Vantagens: topologias adaptadas ao problema, sem precisar definir arquitetura manualmente
+
+Fluxo (seguindo padrão RL):
+1. SEMPRE avalia macro (fornece contexto estratégico)
+2. SEMPRE avalia micro usando melhor macro (recebe contexto)
+3. Evolui apenas as redes indicadas pelo ratio (macro 1x : micro 10x)
 
 Componentes NEAT:
 1. Genomas: representam topologia (nós, conexões, pesos)
@@ -31,12 +37,139 @@ import tempfile
 
 # NEAT imports
 import neat
+from neat.parallel import ParallelEvaluator
+from multiprocessing import Pool, cpu_count
+from functools import partial
 
 from src.pipeline import TradingPipeline
 from src.config import config
 from src.logger import get_logger
 
 logger = get_logger(__name__)
+
+# ============================================================================
+# FUNÇÕES TOP-LEVEL PARA MULTIPROCESSING (devem estar fora de classes)
+# ============================================================================
+
+def evaluate_macro_genome_worker(genome_data, config_macro, envs_data, max_steps=200):
+    """
+    Função worker para avaliar um genoma macro em paralelo.
+    Deve ser top-level para ser picklável.
+    """
+    genome_id, genome = genome_data
+    
+    # Recriar ambientes a partir dos dados
+    envs = []
+    for env_data in envs_data:
+        env = TradingEnvironmentRL(
+            prices=env_data['prices'],
+            macro_features=env_data['macro_features'],
+            micro_features=env_data['micro_features'],
+            initial_capital=env_data['initial_capital'],
+            commission=env_data['commission']
+        )
+        envs.append(env)
+    
+    # Criar rede NEAT uma vez (otimização!)
+    net = neat.nn.FeedForwardNetwork.create(genome, config_macro)
+    
+    total_return = 0.0
+    num_envs = 0
+    
+    for env in envs:
+        state = env.reset()
+        steps = 0
+        
+        while steps < max_steps:
+            # Forward pass
+            macro_output = net.activate(state['macro_features'])
+            macro_output = np.asarray(macro_output, dtype=np.float32)
+            
+            # Escolher ação
+            action_logits = macro_output[:3]
+            if action_logits.shape[0] < 3:
+                action_logits = np.pad(action_logits, (0, 3 - action_logits.shape[0]), constant_values=0.0)
+            
+            if np.allclose(action_logits, action_logits[0], atol=1e-6):
+                action = np.random.randint(0, 3)
+            else:
+                action = int(np.argmax(action_logits))
+            
+            next_state, reward, done = env.step(action)
+            steps += 1
+            
+            if done or next_state is None:
+                break
+            
+            state = next_state
+        
+        final_return = ((env.portfolio_value - 10000) / 10000) * 100
+        total_return += final_return
+        num_envs += 1
+    
+    fitness = total_return / max(1, num_envs)
+    genome.fitness = fitness
+    return genome_id, genome, fitness
+
+
+def evaluate_micro_genome_worker(genome_data, config_micro, best_macro_genome, config_macro, envs_data, max_steps=200):
+    """
+    Função worker para avaliar um genoma micro em paralelo.
+    """
+    genome_id, genome = genome_data
+    
+    # Recriar ambientes
+    envs = []
+    for env_data in envs_data:
+        env = TradingEnvironmentRL(
+            prices=env_data['prices'],
+            macro_features=env_data['macro_features'],
+            micro_features=env_data['micro_features'],
+            initial_capital=env_data['initial_capital'],
+            commission=env_data['commission']
+        )
+        envs.append(env)
+    
+    # Criar redes NEAT uma vez
+    macro_net = neat.nn.FeedForwardNetwork.create(best_macro_genome, config_macro)
+    micro_net = neat.nn.FeedForwardNetwork.create(genome, config_micro)
+    
+    total_return = 0.0
+    num_envs = 0
+    
+    for env in envs:
+        state = env.reset()
+        steps = 0
+        
+        while steps < max_steps:
+            # Macro context
+            macro_output = np.asarray(macro_net.activate(state['macro_features']), dtype=np.float32)
+            
+            # Micro input
+            micro_input = np.concatenate([
+                state['micro_features'],
+                macro_output,
+                [state['position'], state['cash'] / 10000.0]
+            ])
+            
+            micro_output = np.asarray(micro_net.activate(micro_input), dtype=np.float32)
+            action = np.argmax(micro_output) % 3
+            
+            next_state, reward, done = env.step(action)
+            steps += 1
+            
+            if done or next_state is None:
+                break
+            
+            state = next_state
+        
+        final_return = ((env.portfolio_value - 10000) / 10000) * 100
+        total_return += final_return
+        num_envs += 1
+    
+    fitness = total_return / max(1, num_envs)
+    genome.fitness = fitness
+    return genome_id, genome, fitness
 
 
 class NEATNetworkAdapter:
@@ -239,7 +372,7 @@ class AsymmetricNEATTrainer:
         
         logger.info("asymmetric_neat_trainer_initialized")
     
-    def eval_macro_genome(self, genome: neat.DefaultGenome, envs: List[TradingEnvironmentRL]) -> float:
+    def eval_macro_genome(self, genome: neat.DefaultGenome, envs: List[TradingEnvironmentRL], max_steps: int = 200) -> float:
         """
         Avaliar fitness de um genoma MacroNet sobre múltiplos ambientes.
         
@@ -253,16 +386,17 @@ class AsymmetricNEATTrainer:
         total_return = 0.0
         num_envs = 0
         
-        for env in envs:
+        # Criar rede NEAT uma vez para reutilização (OTIMIZAÇÃO!)
+        net = neat.nn.FeedForwardNetwork.create(genome, self.config_macro)
+        
+        for env_idx, env in enumerate(envs):
             state = env.reset()
             total_reward = 0.0
+            steps = 0
             
-            while True:
-                # Forward pass: macro features → [embed_1, embed_2, ...]
-                macro_output = self.macro_adapter.forward_neat(
-                    genome,
-                    state['macro_features']
-                )
+            while steps < max_steps:
+                # Forward pass: usar rede já criada (mais rápido!)
+                macro_output = np.asarray(net.activate(state['macro_features']), dtype=np.float32)
                 
                 # Macro output = contexto de longo prazo
                 # Simplicidade: usar saída diretamente como "confiança" para ações
@@ -280,8 +414,9 @@ class AsymmetricNEATTrainer:
                 
                 next_state, reward, done = env.step(action)
                 total_reward += reward
+                steps += 1
                 
-                if done:
+                if done or next_state is None:
                     break
                 
                 state = next_state
@@ -291,13 +426,16 @@ class AsymmetricNEATTrainer:
             num_envs += 1
         
         fitness = total_return / max(1, num_envs)
-        return fitness
+        avg_portfolio = np.mean([env.portfolio_value for env in envs])
+        avg_step_reward = np.mean([total_reward for env in envs]) # Média da soma das recompensas
+        return fitness, avg_portfolio, avg_step_reward
     
     def eval_micro_genome(
         self,
         macro_genome: neat.DefaultGenome,
         micro_genome: neat.DefaultGenome,
-        envs: List[TradingEnvironmentRL]
+        envs: List[TradingEnvironmentRL],
+        max_steps: int = 200
     ) -> float:
         """
         Avaliar fitness de um genoma MicroNet.
@@ -314,16 +452,18 @@ class AsymmetricNEATTrainer:
         total_return = 0.0
         num_envs = 0
         
+        # Criar redes NEAT uma vez (OTIMIZAÇÃO!)
+        macro_net = neat.nn.FeedForwardNetwork.create(macro_genome, self.config_macro)
+        micro_net = neat.nn.FeedForwardNetwork.create(micro_genome, self.config_micro)
+        
         for env in envs:
             state = env.reset()
             total_reward = 0.0
+            steps = 0
             
-            while True:
-                # Macro: contexto de longo prazo
-                macro_output = self.macro_adapter.forward_neat(
-                    macro_genome,
-                    state['macro_features']
-                )
+            while steps < max_steps:
+                # Macro: usar rede já criada
+                macro_output = np.asarray(macro_net.activate(state['macro_features']), dtype=np.float32)
                 
                 # Micro: recebe micro_features + macro_output concatenados
                 micro_input = np.concatenate([
@@ -332,18 +472,16 @@ class AsymmetricNEATTrainer:
                     [state['position'], state['cash'] / 10000.0]
                 ])
                 
-                micro_output = self.micro_adapter.forward_neat(
-                    micro_genome,
-                    micro_input
-                )
+                micro_output = np.asarray(micro_net.activate(micro_input), dtype=np.float32)
                 
                 # Ação: argmax de micro output
                 action = np.argmax(micro_output) % 3
                 
                 next_state, reward, done = env.step(action)
                 total_reward += reward
+                steps += 1
                 
-                if done:
+                if done or next_state is None:
                     break
                 
                 state = next_state
@@ -353,7 +491,9 @@ class AsymmetricNEATTrainer:
             num_envs += 1
         
         fitness = total_return / max(1, num_envs)
-        return fitness
+        avg_portfolio = np.mean([env.portfolio_value for env in envs])
+        avg_step_reward = np.mean([total_reward for env in envs]) # Média da soma das recompensas
+        return fitness, avg_portfolio, avg_step_reward
     
     def evolve_generation(
         self,
@@ -361,10 +501,12 @@ class AsymmetricNEATTrainer:
         micro_genomes: Dict,
         envs: List[TradingEnvironmentRL],
         update_macro: bool = False,
-        update_micro: bool = True
-    ) -> Tuple[float, float]:
+        update_micro: bool = True,
+        use_multiprocessing: bool = True,
+        max_steps: int = 200  # Reduzido de 500 para 200 para speedup
+    ) -> Tuple[float, float, float, float, float, float, float]:
         """
-        Executar uma geração de evolução (NEAT com seleção natural + crossover + mutação).
+        Executar uma geração de evolução com MULTIPROCESSING REAL.
         
         Args:
             macro_genomes: dict {genome_id: genome} de genomas macro
@@ -372,46 +514,190 @@ class AsymmetricNEATTrainer:
             envs: ambientes para avaliação
             update_macro: se deve evoluir população macro
             update_micro: se deve evoluir população micro
+            use_multiprocessing: usar Pool para paralelização
+            max_steps: máximo de steps por episódio (reduzir para speedup)
         
         Returns:
-            (best_macro_fitness, best_micro_fitness)
+            (best_macro_fitness, best_micro_fitness, avg_macro_portfolio, avg_micro_portfolio, avg_macro_reward, avg_micro_reward, eval_time)
         """
         
-        # Avaliar genomas macro
+        avg_macro_portfolio = 0.0
+        avg_micro_portfolio = 0.0
+        avg_macro_reward = 0.0
+        avg_micro_reward = 0.0
+        eval_start_time = time.time()
+        
+        # Preparar dados dos ambientes para serialização
+        envs_data = []
+        for env in envs:
+            envs_data.append({
+                'prices': env.prices,
+                'macro_features': env.macro_features,
+                'micro_features': env.micro_features,
+                'initial_capital': env.initial_capital,
+                'commission': env.commission
+            })
+
+        # ═════════════════════════════════════════════════════════════
+        # NEAT ASYMMETRIC PATTERN (CORRETO):
+        # 1. SEMPRE avaliar primeiro (garante fitness para todos)
+        # 2. DEPOIS reproduzir (usando fitness da avaliação)
+        # Isso funciona porque após reproduce, na PRÓXIMA chamada
+        # já avaliamos a nova população antes de reproduzir novamente.
+        # ═══════════════════════════════════════════════════════════
+        
+        # Pegar população atual
+        macro_genomes = self.macro_population.population
+        micro_genomes = self.micro_population.population
+        
+        # ─────────────────────────────────────────────────────────────
+        # PASSO 2: AVALIAR MACRO (sempre, nova geração precisa de fitness)
+        # ─────────────────────────────────────────────────────────────
+        macro_eval_start = time.time()
+        total_genomes_macro = len(macro_genomes)
+        
+        if use_multiprocessing and total_genomes_macro > 1:
+            with Pool(processes=cpu_count()) as pool:
+                eval_func = partial(
+                    evaluate_macro_genome_worker,
+                    config_macro=self.config_macro,
+                    envs_data=envs_data,
+                    max_steps=max_steps
+                )
+                results = pool.map(eval_func, list(macro_genomes.items()))
+            
+            # Atualizar fitness nos genomas originais da população
+            for genome_id, genome_result, fitness in results:
+                self.macro_population.population[genome_id].fitness = fitness
+        else:
+            # Sequencial
+            for idx, (gid, genome) in enumerate(macro_genomes.items(), 1):
+                fitness, _, _ = self.eval_macro_genome(genome, envs, max_steps=max_steps)
+                genome.fitness = fitness
+
+        # Calcular métricas médias macro
+        macro_portfolios = []
+        for genome in list(macro_genomes.values())[:5]:
+            _, portfolio, _ = self.eval_macro_genome(genome, envs[:2], max_steps=100)
+            macro_portfolios.append(portfolio)
+
+        if macro_genomes:
+            self.best_macro_fitness = max(g.fitness for g in macro_genomes.values() if g.fitness is not None)
+            avg_macro_portfolio = np.mean(macro_portfolios) if macro_portfolios else 0
+        
+        macro_eval_time = time.time() - macro_eval_start
+        
+        # ─────────────────────────────────────────────────────────────
+        # PASSO 2: AVALIAR MICRO (sempre, usando melhor macro)
+        # ─────────────────────────────────────────────────────────────
+        micro_eval_start = time.time()
+        best_macro_genome_id = max(self.macro_population.population, key=lambda g: self.macro_population.population[g].fitness or -np.inf)
+        best_macro = self.macro_population.population[best_macro_genome_id]
+        total_genomes_micro = len(micro_genomes)
+
+        if use_multiprocessing and total_genomes_micro > 1:
+            with Pool(processes=cpu_count()) as pool:
+                eval_func = partial(
+                    evaluate_micro_genome_worker,
+                    config_micro=self.config_micro,
+                    best_macro_genome=best_macro,
+                    config_macro=self.config_macro,
+                    envs_data=envs_data,
+                    max_steps=max_steps
+                )
+                results = pool.map(eval_func, list(micro_genomes.items()))
+            
+            # Atualizar fitness nos genomas originais da população
+            for genome_id, genome_result, fitness in results:
+                self.micro_population.population[genome_id].fitness = fitness
+        else:
+            # Sequencial
+            for idx, (gid, genome) in enumerate(micro_genomes.items(), 1):
+                fitness, _, _ = self.eval_micro_genome(best_macro, genome, envs, max_steps=max_steps)
+                genome.fitness = fitness
+
+        # Calcular métricas médias micro
+        micro_portfolios = []
+        for genome in list(micro_genomes.values())[:5]:
+            _, portfolio, _ = self.eval_micro_genome(best_macro, genome, envs[:2], max_steps=100)
+            micro_portfolios.append(portfolio)
+
+        if micro_genomes:
+            self.best_micro_fitness = max(g.fitness for g in micro_genomes.values() if g.fitness is not None)
+            avg_micro_portfolio = np.mean(micro_portfolios) if micro_portfolios else 0
+        
+        micro_eval_time = time.time() - micro_eval_start
+        
+        # ─────────────────────────────────────────────────────────────
+        # PASSO 3: REPRODUZIR (apenas se update_X=True)
+        # Agora todos os genomas têm fitness fresh da avaliação acima
+        # ─────────────────────────────────────────────────────────────
         if update_macro:
-            print("\n  🧬 Evoluindo MacroNet...")
-            macro_fitness = {}
-            for gid, genome in macro_genomes.items():
-                macro_fitness[gid] = self.eval_macro_genome(genome, envs)
-                print(f"    Macro #{gid}: fitness = {macro_fitness[gid]:.6f}")
+            # Limpar espécies vazias antes de reproduzir
+            self.macro_population.species.species = {
+                sid: s for sid, s in self.macro_population.species.species.items()
+                if len(s.members) > 0
+            }
             
-            # Especiação e seleção
-            self.macro_population.species.speciate(self.config_macro, macro_genomes, self.generation_macro)
-            for genome in self.macro_population.species.get_fitnesses():
-                pass  # NEAT cuida da seleção
-            
+            self.macro_population.reproduction.reproduce(
+                self.config_macro, self.macro_population.species,
+                self.config_macro.pop_size, self.generation_macro
+            )
             self.generation_macro += 1
-            self.best_macro_fitness = max(macro_fitness.values())
-            print(f"    ✅ Melhor macro fitness: {self.best_macro_fitness:.4f}")
         
-        # Avaliar genomas micro
         if update_micro:
-            print("\n  🧬 Evoluindo MicroNet...")
-            # Usar melhor genoma macro como referência
-            best_macro = max(macro_genomes.items(), key=lambda x: self.eval_macro_genome(x[1], envs))[1]
+            # Limpar espécies vazias antes de reproduzir
+            self.micro_population.species.species = {
+                sid: s for sid, s in self.micro_population.species.species.items()
+                if len(s.members) > 0
+            }
             
-            micro_fitness = {}
-            for gid, genome in micro_genomes.items():
-                micro_fitness[gid] = self.eval_micro_genome(best_macro, genome, envs)
-                print(f"    Micro #{gid}: fitness = {micro_fitness[gid]:.6f}")
-            
-            self.micro_population.species.speciate(self.config_micro, micro_genomes, self.generation_micro)
-            
+            self.micro_population.reproduction.reproduce(
+                self.config_micro, self.micro_population.species,
+                self.config_micro.pop_size, self.generation_micro
+            )
             self.generation_micro += 1
-            self.best_micro_fitness = max(micro_fitness.values())
-            print(f"    ✅ Melhor micro fitness: {self.best_micro_fitness:.4f}")
         
-        return self.best_macro_fitness, self.best_micro_fitness
+        eval_total_time = time.time() - eval_start_time
+        return self.best_macro_fitness, self.best_micro_fitness, avg_macro_portfolio, avg_micro_portfolio, avg_macro_reward, avg_micro_reward, eval_total_time
+
+
+class ParallelEvaluationHelper:
+    """Helper class para encapsular contexto de avaliação paralela."""
+    
+    def __init__(self, trainer, envs, eval_type='macro', best_macro_genome=None):
+        """
+        Args:
+            trainer: instância do AsymmetricNEATTrainer
+            envs: lista de ambientes
+            eval_type: 'macro' ou 'micro'
+            best_macro_genome: genoma macro (usado apenas para eval_type='micro')
+        """
+        self.trainer = trainer
+        self.envs = envs
+        self.eval_type = eval_type
+        self.best_macro_genome = best_macro_genome
+    
+    def evaluate_genome(self, genome_data, config):
+        """
+        Função de avaliação compatível com ParallelEvaluator.
+        
+        Args:
+            genome_data: tupla (genome_id, genome)
+            config: configuração NEAT
+        
+        Returns:
+            fitness do genoma
+        """
+        genome_id, genome = genome_data
+        
+        if self.eval_type == 'macro':
+            fitness, _, _ = self.trainer.eval_macro_genome(genome, self.envs)
+        else:  # micro
+            fitness, _, _ = self.trainer.eval_micro_genome(self.best_macro_genome, genome, self.envs)
+        
+        genome.fitness = fitness
+        return fitness
 
 
 def prepare_asymmetric_data(
@@ -584,19 +870,23 @@ def create_neat_config(
 def train_asymmetric_neat(
     duration_minutes: int = 10,
     log_interval_seconds: int = 30,
+    portfolio_target: float = 12000.0,
     num_envs: int = 8,
     population_size: int = 50
 ):
     """
     Treinar redes com NEAT assimétrico.
     
-    - MacroNet: evolui 1x a cada 2 gerações
-    - MicroNet: evolui 1x por geração
-    - Ambos começam com topologia simples, evoluem para mais complexos
+    - MacroNet: evolui 1x a cada 10 episódios (estratégia)
+    - MicroNet: evolui 1x por episódio (tática)
+    - Ratio: 1:10 (extremamente ágil)
     """
     print("\n" + "="*70)
     print("  🧬 TREINAMENTO ASSIMÉTRICO COM NEAT")
-    print("  MacroNet: Evolução 1x a cada 2 gerações (longo prazo)")
+    print("  MacroNet: Evolução 1x a cada 10 episódios (longo prazo)")
+    print("  MicroNet: Evolução 1x por episódio (curto prazo, MUITO ágil)")
+    print("  Ratio: 1:10 🚀")
+    print("="*70 + "\n")
     print("  MicroNet: Evolução 1x por geração (curto prazo)")
     print("="*70 + "\n")
     
@@ -686,20 +976,29 @@ def train_asymmetric_neat(
     print(f"📊 Dataset: {len(prices)} candles")
     print(f"💰 Capital inicial: $10,000")
     print(f"🧬 População inicial: {population_size} indivíduos (macro + micro)")
-    print(f"⚙️  Macro: atualiza a cada 2 gerações | Micro: atualiza a cada geração")
+    print(f"⚙️  Estratégia: 1 macro update : 10 micro updates (ALTA AGILIDADE)")
     print(f"🧪 Ambientes paralelos: {len(envs)}\n")
     
+    # Multiprocessing ativado!
+    print(f"🚀 Usando MULTIPROCESSING com {cpu_count()} workers (paralelização real!)")
+    print(f"⚡ Steps reduzidos para 200 para maior velocidade")
+
     # 5. Evoluir
     start_time = time.time()
     end_time = start_time + (duration_minutes * 60)
     last_log_time = start_time
     
-    generation = 0
+    episode = 0
+    recent_portfolios = []
+    
     history = {
-        'generation': [],
         'time_min': [],
-        'macro_fitness': [],
-        'micro_fitness': []
+        'episode': [],
+        'macro_updates': [],
+        'micro_updates': [],
+        'avg_portfolio': [],
+        'avg_return_pct': [],
+        'avg_reward': []
     }
     
     table_header_printed = False
@@ -707,118 +1006,183 @@ def train_asymmetric_neat(
     while time.time() < end_time:
         elapsed = time.time() - start_time
         
-        # Decidir qual população evoluir
-        # Ratio 1:2 → a cada 3 gerações: [M+m, m, m] (simplificado: alternado)
-        macro_update = generation % 2 == 0
-        micro_update = True  # Micro sempre evolui
+        # Padrão 1:10 - Macro evolui a cada 10 episódios, Micro evolui sempre
+        macro_update = (episode % 10 == 0)  # Macro: episódios 0, 10, 20, 30...
+        micro_update = True  # Micro: SEMPRE
         
-        print(f"\n🔄 Geração {generation}...")
-        if macro_update:
-            print("   ├─ 🧬 MacroNet evoluindo")
-        if micro_update:
-            print("   └─ 🧬 MicroNet evoluindo")
-        
-        # Avaliar e evoluir
-        best_macro_fitness, best_micro_fitness = trainer.evolve_generation(
+        # Avaliar e evoluir (COM MULTIPROCESSING!)
+        result = trainer.evolve_generation(
             macro_genomes=trainer.macro_population.population,
             micro_genomes=trainer.micro_population.population,
             envs=envs,
             update_macro=macro_update,
-            update_micro=micro_update
+            update_micro=micro_update,
+            use_multiprocessing=True,  # ATIVADO!
+            max_steps=200  # Reduzido para speedup
         )
+        best_macro_fitness, best_micro_fitness, avg_macro_portfolio, avg_micro_portfolio, avg_macro_reward, avg_micro_reward, eval_time = result
         
-        generation += 1
+        # Usar portfolio micro como primário (sempre atualizado)
+        current_portfolio = avg_micro_portfolio if avg_micro_portfolio > 0 else avg_macro_portfolio
+        recent_portfolios.append(current_portfolio)
+        if len(recent_portfolios) > 10:
+            recent_portfolios.pop(0)
+        
+        episode += 1
         
         # Log periódico
         current_time = time.time()
-        if current_time - last_log_time >= log_interval_seconds or generation % 5 == 0:
+        if current_time - last_log_time >= log_interval_seconds or episode % 5 == 0:
             if not table_header_printed:
-                print("\nGen | Tempo(min) | MacroFit | MicroFit | PopMacro | PopMicro")
-                print("-" * 60)
+                print("\nTempo(min) | Episódio | MacroUpd | MicroUpd | Ratio | Portfolio Médio | Δ%     | Reward Médio | Gap p/ Meta")
+                print("-" * 105)
                 table_header_printed = True
             
-            pop_size_macro = len(trainer.macro_population.population)
-            pop_size_micro = len(trainer.micro_population.population)
+            avg_portfolio = np.mean(recent_portfolios) if recent_portfolios else 10000
+            return_pct = ((avg_portfolio - 10000) / 10000) * 100
+            reward_avg = best_micro_fitness  # Usar micro fitness como reward
+            gap_to_target = portfolio_target - avg_portfolio
             
+            ratio = trainer.generation_micro / max(1, trainer.generation_macro)
+
             print(
-                f"{generation:>3} | {elapsed/60:>9.1f} | "
-                f"{best_macro_fitness:>10.6f} | {best_micro_fitness:>10.6f} | "
-                f"{pop_size_macro:>8} | {pop_size_micro:>8}"
+                f"{elapsed/60:>9.1f} | {episode:>8} | {trainer.generation_macro:>8} | "
+                f"{trainer.generation_micro:>8} | {ratio:>5.1f} | ${avg_portfolio:>14,.2f} | "
+                f"{return_pct:>6.2f}% | {reward_avg:>12.2f} | ${gap_to_target:>11,.2f}"
             )
             
-            history['generation'].append(generation)
             history['time_min'].append(elapsed / 60)
-            history['macro_fitness'].append(best_macro_fitness)
-            history['micro_fitness'].append(best_micro_fitness)
+            history['episode'].append(episode)
+            history['macro_updates'].append(trainer.generation_macro)
+            history['micro_updates'].append(trainer.generation_micro)
+            history['avg_portfolio'].append(avg_portfolio)
+            history['avg_return_pct'].append(return_pct)
+            history['avg_reward'].append(reward_avg)
             
             last_log_time = current_time
+
+        # Salvar modelo e tabela periodicamente
+        if episode % 100 == 0 and episode > 0:
+            print(f"\n💾 Salvamento periódico no episódio {episode}...")
+            output_dir = Path("./training_results_neat")
+            output_dir.mkdir(parents=True, exist_ok=True)
+
+            # Salvar melhores genomas
+            best_macro_genome_id = max(trainer.macro_population.population, key=lambda g: trainer.macro_population.population[g].fitness or -np.inf)
+            best_macro = trainer.macro_population.population[best_macro_genome_id]
+            
+            best_micro_genome_id = max(trainer.micro_population.population, key=lambda g: trainer.micro_population.population[g].fitness or -np.inf)
+            best_micro = trainer.micro_population.population[best_micro_genome_id]
+
+            with open(output_dir / f"best_macro_genome_ep{episode}.pkl", "wb") as f:
+                pickle.dump(best_macro, f)
+            
+            with open(output_dir / f"best_micro_genome_ep{episode}.pkl", "wb") as f:
+                pickle.dump(best_micro, f)
+
+            # Salvar tabela de evolução
+            history_df = pd.DataFrame(history)
+            history_df.to_csv(output_dir / f"evolution_table_ep{episode}.csv", index=False)
+            print(f"✅ Modelos e tabela de evolução salvos em {output_dir}/")
+
     
-    # Salvar melhor genoma
+    # Salvar melhor genoma no final
+    total_time = time.time() - start_time
     output_dir = Path("./training_results_neat")
     output_dir.mkdir(parents=True, exist_ok=True)
     
-    best_macro = max(
-        trainer.macro_population.population.items(),
-        key=lambda x: trainer.eval_macro_genome(x[1], envs)
-    )[1]
-    best_micro = max(
-        trainer.micro_population.population.items(),
-        key=lambda x: trainer.eval_micro_genome(best_macro, x[1], envs)
-    )[1]
+    best_macro_genome_id = max(
+        trainer.macro_population.population,
+        key=lambda g: trainer.macro_population.population[g].fitness or -np.inf
+    )
+    best_macro = trainer.macro_population.population[best_macro_genome_id]
+
+    best_micro_genome_id = max(
+        trainer.micro_population.population,
+        key=lambda g: trainer.micro_population.population[g].fitness or -np.inf
+    )
+    best_micro = trainer.micro_population.population[best_micro_genome_id]
     
-    with open(output_dir / "best_macro_genome.pkl", "wb") as f:
+    with open(output_dir / "best_macro_genome_final.pkl", "wb") as f:
         pickle.dump(best_macro, f)
     
-    with open(output_dir / "best_micro_genome.pkl", "wb") as f:
+    with open(output_dir / "best_micro_genome_final.pkl", "wb") as f:
         pickle.dump(best_micro, f)
+
+    # Salvar tabela de evolução final
+    history_df = pd.DataFrame(history)
+    history_df.to_csv(output_dir / "evolution_table_final.csv", index=False)
     
-    print(f"\n✅ Treinamento NEAT assimétrico completo: {generation} gerações")
-    print(f"🧬 Melhor MacroNet fitness: {best_macro_fitness:.4f}")
-    print(f"🧬 Melhor MicroNet fitness: {best_micro_fitness:.4f}")
+    print(f"\n✅ Treinamento NEAT assimétrico completo: {episode} episódios em {total_time/60:.1f}min")
+    print(f"🔄 Total updates - Macro: {trainer.generation_macro} | Micro: {trainer.generation_micro}")
+    print(f"📊 Ratio final: 1:{trainer.generation_micro/max(1, trainer.generation_macro):.2f}")
+    print(f"🧬 Melhor MacroNet fitness: {trainer.best_macro_fitness:.4f}")
+    print(f"🧬 Melhor MicroNet fitness: {trainer.best_micro_fitness:.4f}")
     print(f"💾 Genomas salvos em: {output_dir}/")
     
     # Plot
-    if history['generation']:
-        plot_neat_evolution(history, output_dir, elapsed / 60, generation)
+    if history['episode']:
+        plot_neat_evolution(history, output_dir, total_time / 60, episode, trainer)
 
 
-def plot_neat_evolution(history: dict, output_dir: Path, total_time: float, generations: int):
+def plot_neat_evolution(history: dict, output_dir: Path, total_time: float, episodes: int, trainer):
     """Plotar evolução NEAT"""
     
     print(f"\n📊 Gerando gráfico de evolução...")
     
-    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(14, 5))
+    fig, axes = plt.subplots(2, 2, figsize=(14, 10))
     fig.suptitle(
-        f'Evolução NEAT Assimétrica - {total_time:.1f} min, {generations} gerações',
+        f'Treinamento NEAT Assimétrico (1:10) - {total_time:.1f} min, {episodes} episódios',
         fontsize=14,
         fontweight='bold'
     )
     
     time_axis = history['time_min']
     
-    # 1. Fitness ao longo das gerações
-    ax1.plot(time_axis, history['macro_fitness'], 'r-o', linewidth=2, label='MacroNet')
-    ax1.plot(time_axis, history['micro_fitness'], 'b-o', linewidth=2, label='MicroNet')
+    # 1. Portfolio
+    ax1 = axes[0, 0]
+    ax1.plot(time_axis, history['avg_portfolio'], 'b-', linewidth=2)
+    ax1.axhline(y=10000, color='gray', linestyle='--', alpha=0.5, label='Initial')
     ax1.set_xlabel('Tempo (minutos)')
-    ax1.set_ylabel('Fitness (Return %)')
-    ax1.set_title('Melhor Fitness por Geração')
+    ax1.set_ylabel('Portfolio Value ($)')
+    ax1.set_title('Evolução do Portfolio')
     ax1.grid(True, alpha=0.3)
     ax1.legend()
+    ax1.yaxis.set_major_formatter(plt.FuncFormatter(lambda x, p: f'${x/1000:.1f}k'))
     
-    # 2. Fitness relativo
-    ax2.plot(time_axis, history['macro_fitness'], 'r-', linewidth=2, label='MacroNet', alpha=0.7)
-    ax2.plot(time_axis, history['micro_fitness'], 'b-', linewidth=2, label='MicroNet', alpha=0.7)
-    ax2.fill_between(time_axis, history['macro_fitness'], alpha=0.2, color='red')
-    ax2.fill_between(time_axis, history['micro_fitness'], alpha=0.2, color='blue')
+    # 2. Returns
+    ax2 = axes[0, 1]
+    ax2.plot(time_axis, history['avg_return_pct'], 'g-', linewidth=2)
+    ax2.axhline(y=0, color='gray', linestyle='--', alpha=0.5)
     ax2.set_xlabel('Tempo (minutos)')
-    ax2.set_ylabel('Fitness (Return %)')
-    ax2.set_title('Fitness Evolution')
+    ax2.set_ylabel('Return (%)')
+    ax2.set_title('Retorno Percentual')
     ax2.grid(True, alpha=0.3)
-    ax2.legend()
+    
+    # 3. Updates Count
+    ax3 = axes[1, 0]
+    ax3.plot(time_axis, history['macro_updates'], 'r-', linewidth=2, label='Macro Updates')
+    ax3.plot(time_axis, history['micro_updates'], 'b-', linewidth=2, label='Micro Updates')
+    ax3.set_xlabel('Tempo (minutos)')
+    ax3.set_ylabel('Número de Updates')
+    ax3.set_title('Updates por Componente')
+    ax3.grid(True, alpha=0.3)
+    ax3.legend()
+    
+    # 4. Update Ratio
+    ax4 = axes[1, 1]
+    ratios = [m / max(1, macro) for m, macro in zip(history['micro_updates'], history['macro_updates'])]
+    ax4.plot(time_axis, ratios, 'purple', linewidth=2)
+    ax4.axhline(y=10.0, color='orange', linestyle='--', alpha=0.5, label='Target Ratio (10:1)')
+    ax4.set_xlabel('Tempo (minutos)')
+    ax4.set_ylabel('Ratio (Micro:Macro)')
+    ax4.set_title('Ratio de Updates')
+    ax4.grid(True, alpha=0.3)
+    ax4.legend()
     
     plt.tight_layout()
     
-    plot_path = output_dir / 'neat_evolution.png'
+    plot_path = output_dir / 'neat_asymmetric_evolution.png'
     plt.savefig(plot_path, dpi=150, bbox_inches='tight')
     print(f"✅ Gráfico salvo: {plot_path}")
     
@@ -857,6 +1221,7 @@ if __name__ == "__main__":
     train_asymmetric_neat(
         duration_minutes=999.9,
         log_interval_seconds=30,
+        portfolio_target=12000.0,
         num_envs=8,
         population_size=50
     )

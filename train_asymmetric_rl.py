@@ -934,6 +934,7 @@ def train_asymmetric_rl(
         'episode': [],
         'avg_reward': [],
         'avg_portfolio': [],
+        'avg_return_pct': [],
         'macro_updates': [],
         'micro_updates': []
     }
@@ -985,16 +986,15 @@ def train_asymmetric_rl(
             avg_return_pct = ((avg_portfolio - 10000) / 10000) * 100
             
             if not table_header_printed:
-                print("\nTempo(min) | Episódio | MacroUpd | MicroUpd | Ratio | Portfolio Médio | Δ% | Reward Médio | Gap p/ Meta")
-                print("-" * 105)
+                print("\nTempo(min) | Episódio | MacroUpd | MicroUpd | Ratio | Portfolio Médio | Retorno Médio (%) | Reward Médio")
+                print("-" * 110)
                 table_header_printed = True
 
             ratio = trainer.micro_update_count / max(1, trainer.macro_update_count)
-            gap = avg_portfolio - portfolio_target
             print(
                 f"{elapsed/60:>9.1f} | {episode:>8} | {trainer.macro_update_count:>8} | "
                 f"{trainer.micro_update_count:>8} | {ratio:>5.1f} | ${avg_portfolio:>14,.2f} | "
-                f"{avg_return_pct:>+6.2f}% | {avg_reward:>11.2f} | ${gap:>10,.2f}"
+                f"{avg_return_pct:>16.4f}% | {avg_reward:>12.2f}"
             )
             
             # Salvar histórico
@@ -1002,20 +1002,41 @@ def train_asymmetric_rl(
             history['episode'].append(episode)
             history['avg_reward'].append(avg_reward)
             history['avg_portfolio'].append(avg_portfolio)
+            history['avg_return_pct'].append(avg_return_pct)
             history['macro_updates'].append(trainer.macro_update_count)
             history['micro_updates'].append(trainer.micro_update_count)
             
             last_log_time = current_time
+
+        # Salvar modelo e tabela periodicamente
+        if episode % 100 == 0 and episode > 0:
+            print(f"\n💾 Salvamento periódico no episódio {episode}...")
+            output_dir = Path("./training_results_asymmetric")
+            output_dir.mkdir(parents=True, exist_ok=True)
+            
+            # Salvar modelo
+            model_path = output_dir / f"asymmetric_policy_ep{episode}.pt"
+            torch.save(trainer.policy.state_dict(), model_path)
+
+            # Salvar tabela de evolução
+            history_df = pd.DataFrame(history)
+            history_df.to_csv(output_dir / f"evolution_table_ep{episode}.csv", index=False)
+            print(f"✅ Modelo e tabela de evolução salvos em {output_dir}/")
+
     
     # Final
     total_time = time.time() - start_time
     
-    # Salvar modelo
+    # Salvar modelo final
     output_dir = Path("./training_results_asymmetric")
     output_dir.mkdir(parents=True, exist_ok=True)
     
-    model_path = output_dir / "asymmetric_policy.pt"
+    model_path = output_dir / "asymmetric_policy_final.pt"
     torch.save(trainer.policy.state_dict(), model_path)
+
+    # Salvar tabela de evolução final
+    history_df = pd.DataFrame(history)
+    history_df.to_csv(output_dir / "evolution_table_final.csv", index=False)
     
     # Plotar
     plot_asymmetric_history(history, output_dir, total_time, episode, trainer)
@@ -1392,4 +1413,4 @@ if __name__ == "__main__":
     
     # Single run com num_envs=25 (ajuste conforme necessário)
     train_asymmetric_rl(duration_minutes=999.9, log_interval_seconds=20, num_envs=25)
-    
+
